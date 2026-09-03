@@ -8,11 +8,14 @@ pub mod blurred_rounded_rect;
 pub mod clip;
 pub mod emoji_grid;
 pub mod filter;
+pub mod filter_blur_circle;
 pub mod filter_elements;
 pub mod gradient;
 pub mod image;
 pub mod multi_image;
 pub mod path;
+#[cfg(target_arch = "wasm32")]
+pub mod performance;
 pub mod random_text;
 pub mod simple;
 pub mod spritesheet;
@@ -20,8 +23,6 @@ pub mod svg;
 pub mod text;
 
 use glifo::GlyphRunBackend;
-use vello_common::coarse::WideTile;
-use vello_common::color::palette::css::WHITE;
 use vello_common::filter_effects::Filter;
 use vello_common::kurbo::Affine;
 pub use vello_common::kurbo::{BezPath, Rect, Shape, Stroke};
@@ -31,8 +32,8 @@ pub use vello_common::paint::{Paint, PaintType};
 pub use vello_common::peniko::{BlendMode, Fill, FontData, ImageQuality};
 #[cfg(feature = "cpu")]
 use vello_cpu::{RenderContext, Resources as CpuResources};
+pub use vello_hybrid::TextureId;
 use vello_hybrid::{Resources as HybridResources, Scene};
-pub use vello_hybrid::{SampleRect, TextureId};
 
 /// Renderer capability flags controlling which scenes are listed by [`get_example_scenes`].
 ///
@@ -40,8 +41,7 @@ pub use vello_hybrid::{SampleRect, TextureId};
 /// feature are omitted. Defaults to everything off.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Capabilities {
-    /// Whether the renderer supports externally bound textures and
-    /// [`RenderingContext::draw_texture_rects`].
+    /// Whether the renderer supports externally bound textures.
     pub external_textures: bool,
 }
 
@@ -106,14 +106,6 @@ pub trait RenderingContext: Sized {
     fn pop_layer(&mut self);
     /// Pop the last clip path.
     fn pop_clip_path(&mut self);
-    /// Sample rectangular regions from an externally bound texture and draw them with the
-    /// corresponding transforms.
-    fn draw_texture_rects(
-        &mut self,
-        texture_id: TextureId,
-        quality: ImageQuality,
-        rects: impl IntoIterator<Item = SampleRect>,
-    );
 }
 
 #[cfg(feature = "cpu")]
@@ -211,15 +203,6 @@ impl RenderingContext for RenderContext {
     fn pop_clip_path(&mut self) {
         Self::pop_clip_path(self);
     }
-
-    fn draw_texture_rects(
-        &mut self,
-        _texture_id: TextureId,
-        _quality: ImageQuality,
-        _rects: impl IntoIterator<Item = SampleRect>,
-    ) {
-        unimplemented!("vello_cpu does not yet support external textures");
-    }
 }
 
 impl RenderingContext for Scene {
@@ -316,15 +299,6 @@ impl RenderingContext for Scene {
     fn pop_clip_path(&mut self) {
         Self::pop_clip_path(self);
     }
-
-    fn draw_texture_rects(
-        &mut self,
-        texture_id: TextureId,
-        quality: ImageQuality,
-        rects: impl IntoIterator<Item = SampleRect>,
-    ) {
-        self.draw_texture_rects(texture_id, quality, rects);
-    }
 }
 
 /// Example scene that can maintain state between renders.
@@ -353,13 +327,10 @@ pub trait ExampleScene {
 pub struct AnyScene<T: RenderingContext> {
     /// The render function that calls the wrapped scene's render method.
     render_fn: RenderFn<T>,
-    resources: T::Resources,
     /// The key handler function.
     key_handler_fn: KeyHandlerFn,
     /// The status query function.
     status_fn: StatusFn,
-    /// Whether to show the wide tile columns overlay.
-    show_widetile_columns: bool,
 }
 
 /// A type-erased render function.
@@ -373,16 +344,13 @@ type StatusFn = Box<dyn Fn() -> Option<String>>;
 
 impl<T: RenderingContext> std::fmt::Debug for AnyScene<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AnyScene")
-            .field("show_tile_grid", &self.show_widetile_columns)
-            .finish_non_exhaustive()
+        f.debug_struct("AnyScene").finish_non_exhaustive()
     }
 }
 
 impl<T> AnyScene<T>
 where
     T: RenderingContext,
-    T::Resources: Default,
 {
     /// Create a new `AnyScene` from any type that implements `ExampleScene`.
     pub fn new<S: ExampleScene + 'static>(scene: S) -> Self {
@@ -394,71 +362,25 @@ where
             render_fn: Box::new(move |s, resources, transform| {
                 scene.borrow_mut().render(s, resources, transform);
             }),
-            resources: T::Resources::default(),
             key_handler_fn: Box::new(move |key| scene_clone.borrow_mut().handle_key(key)),
             status_fn: Box::new(move || scene_status.borrow().status()),
-            show_widetile_columns: false,
         }
     }
 
     /// Render the scene.
-    pub fn render(&mut self, ctx: &mut T, root_transform: Affine) {
-        // Render the actual scene content
-        (self.render_fn)(ctx, &mut self.resources, root_transform);
-
-        // Draw tile grid overlay if enabled
-        if self.show_widetile_columns {
-            self.draw_widetile_columns(ctx);
-        }
+    pub fn render(&mut self, ctx: &mut T, resources: &mut T::Resources, root_transform: Affine) {
+        (self.render_fn)(ctx, resources, root_transform);
     }
 
     /// Handle key press events.
     /// Returns true if the key was handled, false otherwise.
     pub fn handle_key(&mut self, key: &str) -> bool {
-        // First check for global shortcuts
-        match key {
-            "t" | "T" => {
-                self.toggle_tile_grid();
-                return true;
-            }
-            _ => {}
-        }
-
-        // Then delegate to the scene-specific handler
         (self.key_handler_fn)(key)
     }
 
     /// Get an optional status string from the scene.
     pub fn status(&self) -> Option<String> {
         (self.status_fn)()
-    }
-
-    /// Access the scene-owned resources.
-    pub fn resources_mut(&mut self) -> &mut T::Resources {
-        &mut self.resources
-    }
-
-    /// Toggle the tile grid overlay.
-    pub fn toggle_tile_grid(&mut self) {
-        self.show_widetile_columns = !self.show_widetile_columns;
-    }
-
-    /// Draw the tile grid overlay.
-    ///
-    /// Note: We don't restore transform/paint since this runs at the end of `render()`.
-    fn draw_widetile_columns(&self, ctx: &mut T) {
-        ctx.set_transform(Affine::IDENTITY);
-        ctx.set_paint(WHITE);
-
-        let vw = ctx.width() as f64;
-        let vh = ctx.height() as f64;
-
-        let mut tile_x = 0.0;
-        let line_width = 1.0;
-        while tile_x <= vw {
-            ctx.fill_rect(&Rect::from_points((tile_x, 0.0), (tile_x + line_width, vh)));
-            tile_x += WideTile::WIDTH as f64;
-        }
     }
 }
 
@@ -469,10 +391,7 @@ pub fn get_example_scenes<T: RenderingContext + 'static>(
     capabilities: Capabilities,
     svg_paths: Option<Vec<&str>>,
     img_sources: Vec<ImageSource>,
-) -> Box<[AnyScene<T>]>
-where
-    T::Resources: Default,
-{
+) -> Box<[AnyScene<T>]> {
     let mut scenes = Vec::new();
 
     // Create SVG scenes for each provided path.
@@ -502,6 +421,9 @@ where
         flower_source,
     )));
     scenes.push(AnyScene::new(filter_elements::FilterElementsScene::new()));
+    scenes.push(AnyScene::new(
+        filter_blur_circle::FilterBlurCircleScene::new(),
+    ));
     scenes.push(AnyScene::new(gradient::GradientExtendScene::new()));
     scenes.push(AnyScene::new(gradient::RadialScene::new()));
     scenes.push(AnyScene::new(path::FillTypesScene::new()));
@@ -524,10 +446,7 @@ where
 pub fn get_example_scenes<T: RenderingContext + 'static>(
     capabilities: Capabilities,
     img_sources: Vec<ImageSource>,
-) -> Box<[AnyScene<T>]>
-where
-    T::Resources: Default,
-{
+) -> Box<[AnyScene<T>]> {
     let mut scenes = vec![
         AnyScene::new(svg::SvgScene::tiger()),
         AnyScene::new(text::TextScene::new("Hello, Vello!")),
@@ -541,6 +460,7 @@ where
         AnyScene::new(image::ImageScene::new(img_sources.clone())),
         AnyScene::new(multi_image::MultiImageScene::new(img_sources[0].clone())),
         AnyScene::new(filter_elements::FilterElementsScene::new()),
+        AnyScene::new(filter_blur_circle::FilterBlurCircleScene::new()),
         AnyScene::new(gradient::GradientExtendScene::new()),
         AnyScene::new(gradient::RadialScene::new()),
         AnyScene::new(path::FillTypesScene::new()),

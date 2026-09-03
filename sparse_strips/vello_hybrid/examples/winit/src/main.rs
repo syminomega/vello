@@ -15,7 +15,7 @@ use vello_common::paint::ImageSource;
 use vello_example_scenes::image::ImageScene;
 use vello_example_scenes::spritesheet::{SPRITESHEET_TEXTURE_ID, SpritesheetScene};
 use vello_example_scenes::{AnyScene, Capabilities, get_example_scenes};
-use vello_hybrid::{Pixmap, RenderSize, Renderer, Scene, TextureBindings};
+use vello_hybrid::{Pixmap, RenderSize, Renderer, Resources, Scene, TextureBindings};
 use wgpu::CurrentSurfaceTexture;
 use winit::{
     application::ApplicationHandler,
@@ -31,8 +31,8 @@ struct App<'s> {
     context: RenderContext,
     scenes: Box<[AnyScene<Scene>]>,
     current_scene: usize,
-    renderers: Vec<Option<Renderer>>,
-    uploaded_scene_images: Vec<Vec<bool>>,
+    renderers: Vec<Option<(Renderer, Resources, RenderSize, wgpu::TextureView)>>,
+    uploaded_images: Vec<bool>,
     spritesheet_textures: Vec<Option<wgpu::Texture>>,
     render_state: RenderState<'s>,
     scene: Scene,
@@ -49,7 +49,7 @@ struct App<'s> {
 fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     let (scenes, start_scene_index) = {
-        let mut start_scene_index = 6; // MultiImageScene
+        let mut start_scene_index = 0;
         let args: Vec<String> = env::args().collect();
         let mut svg_paths: Vec<&str> = Vec::new();
 
@@ -98,7 +98,7 @@ fn main() {
     let mut app = App {
         context: RenderContext::new(),
         renderers: vec![],
-        uploaded_scene_images: vec![],
+        uploaded_images: vec![],
         spritesheet_textures: vec![],
         scenes,
         current_scene: start_scene_index,
@@ -161,10 +161,8 @@ impl ApplicationHandler for App<'_> {
 
         self.renderers
             .resize_with(self.context.devices.len(), || None);
-        self.uploaded_scene_images
-            .resize_with(self.context.devices.len(), || {
-                vec![false; self.scenes.len()]
-            });
+        self.uploaded_images
+            .resize(self.context.devices.len(), false);
         self.spritesheet_textures
             .resize_with(self.context.devices.len(), || None);
         self.renderers[surface.dev_id]
@@ -193,14 +191,12 @@ impl ApplicationHandler for App<'_> {
             return;
         }
 
-        let dev_id = surface.dev_id;
-
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 self.context
                     .resize_surface(surface, size.width, size.height);
-                self.scene = Scene::new(
+                self.scene.reset_and_resize(
                     u16::try_from(size.width).unwrap(),
                     u16::try_from(size.height).unwrap(),
                 );
@@ -214,13 +210,10 @@ impl ApplicationHandler for App<'_> {
                     },
                 ..
             } => {
-                let mut upload_images = false;
-
                 match logical_key {
                     Key::Named(NamedKey::ArrowRight) => {
                         self.current_scene = (self.current_scene + 1) % self.scenes.len();
                         self.transform = Affine::IDENTITY;
-                        upload_images = true;
                         window.request_redraw();
                     }
                     Key::Named(NamedKey::ArrowLeft) => {
@@ -230,7 +223,6 @@ impl ApplicationHandler for App<'_> {
                             self.current_scene - 1
                         };
                         self.transform = Affine::IDENTITY;
-                        upload_images = true;
                         window.request_redraw();
                     }
                     Key::Named(NamedKey::Space) => {
@@ -249,12 +241,6 @@ impl ApplicationHandler for App<'_> {
                         }
                     }
                     _ => {}
-                }
-
-                // Each scene has it's own resources struct, so in case the images
-                // haven't been uploaded previously, we need to do it now.
-                if upload_images {
-                    self.upload_images_to_atlas(dev_id);
                 }
             }
             WindowEvent::MouseInput {
@@ -355,7 +341,8 @@ impl ApplicationHandler for App<'_> {
                 let render_start = Instant::now();
 
                 self.scene.set_transform(self.transform);
-                self.scenes[self.current_scene].render(&mut self.scene, self.transform);
+                let (_, resources, ..) = self.renderers[surface.dev_id].as_mut().unwrap();
+                self.scenes[self.current_scene].render(&mut self.scene, resources, self.transform);
 
                 let device_handle = &self.context.devices[surface.dev_id];
                 let render_size = RenderSize {
@@ -396,17 +383,23 @@ impl ApplicationHandler for App<'_> {
                         texture.create_view(&wgpu::TextureViewDescriptor::default()),
                     );
                 }
-                self.renderers[surface.dev_id]
-                    .as_mut()
-                    .unwrap()
+                let (renderer, resources, depth_render_size, depth_texture_view) =
+                    self.renderers[surface.dev_id].as_mut().unwrap();
+                if *depth_render_size != render_size {
+                    *depth_render_size = render_size.clone();
+                    *depth_texture_view =
+                        Renderer::create_depth_texture_view(&device_handle.device, &render_size);
+                }
+                renderer
                     .render(
                         &self.scene,
-                        self.scenes[self.current_scene].resources_mut(),
+                        resources,
                         &device_handle.device,
                         &device_handle.queue,
                         &mut encoder,
                         &render_size,
                         &texture_view,
+                        Some(depth_texture_view),
                         &texture_bindings,
                     )
                     .unwrap();
@@ -428,7 +421,7 @@ impl ApplicationHandler for App<'_> {
 
 impl App<'_> {
     fn upload_images_to_atlas(&mut self, device_id: usize) {
-        if self.uploaded_scene_images[device_id][self.current_scene] {
+        if self.uploaded_images[device_id] {
             return;
         }
 
@@ -442,8 +435,9 @@ impl App<'_> {
 
         // 1st example — uploading pixmap directly
         let pixmap1 = ImageScene::read_flower_image();
-        self.renderers[device_id].as_mut().unwrap().upload_image(
-            self.scenes[self.current_scene].resources_mut(),
+        let (renderer, resources, ..) = self.renderers[device_id].as_mut().unwrap();
+        renderer.upload_image(
+            resources,
             &device_handle.device,
             &device_handle.queue,
             &mut encoder,
@@ -454,8 +448,9 @@ impl App<'_> {
         let pixmap2 = ImageScene::read_cowboy_image();
         let texture2 =
             self.upload_image_to_texture(&device_handle.device, &device_handle.queue, &pixmap2);
-        self.renderers[device_id].as_mut().unwrap().upload_image(
-            self.scenes[self.current_scene].resources_mut(),
+        let (renderer, resources, ..) = self.renderers[device_id].as_mut().unwrap();
+        renderer.upload_image(
+            resources,
             &device_handle.device,
             &device_handle.queue,
             &mut encoder,
@@ -463,7 +458,7 @@ impl App<'_> {
         );
 
         device_handle.queue.submit([encoder.finish()]);
-        self.uploaded_scene_images[device_id][self.current_scene] = true;
+        self.uploaded_images[device_id] = true;
     }
 
     fn ensure_spritesheet_uploaded(&mut self, device_id: usize) {

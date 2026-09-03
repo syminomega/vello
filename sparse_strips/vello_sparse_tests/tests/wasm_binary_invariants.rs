@@ -69,7 +69,7 @@ async fn webgl_probe_succeeds() {
     canvas.set_width(200);
     canvas.set_height(200);
 
-    let mut renderer = vello_hybrid::WebGlRenderer::new(&canvas);
+    let (mut renderer, _) = vello_hybrid::WebGlRenderer::new(&canvas);
     let mut pending = renderer
         .probe()
         .unwrap_or_else(|error| panic!("WebGlRenderer::probe() failed to render: {error:?}"));
@@ -92,6 +92,52 @@ async fn webgl_probe_succeeds() {
 
     panic!(
         "WebGlRenderer::probe() did not finish within {} animation frames",
+        MAX_FRAMES
+    );
+}
+
+#[cfg(feature = "webgl")]
+#[wasm_bindgen_test]
+async fn webgl_pending_renderer_init_completes() {
+    use vello_hybrid::WebGlRendererInitStatus;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::HtmlCanvasElement;
+
+    async fn wait_for_animation_frame() {
+        let promise = web_sys::js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .request_animation_frame(&resolve)
+                .unwrap();
+        });
+        JsFuture::from(promise).await.unwrap();
+    }
+
+    let document = web_sys::window().unwrap().document().unwrap();
+    let canvas = document
+        .create_element("canvas")
+        .unwrap()
+        .dyn_into::<HtmlCanvasElement>()
+        .unwrap();
+    canvas.set_width(16);
+    canvas.set_height(16);
+
+    let (mut init, _) = vello_hybrid::WebGlRenderer::begin(&canvas);
+    const MAX_FRAMES: u32 = 600;
+
+    for _ in 0..MAX_FRAMES {
+        match init.try_finish() {
+            WebGlRendererInitStatus::Complete(_) => return,
+            WebGlRendererInitStatus::Pending(next_init) => {
+                init = next_init;
+                wait_for_animation_frame().await;
+            }
+        }
+    }
+
+    panic!(
+        "WebGlRenderer initialization did not finish within {} animation frames",
         MAX_FRAMES
     );
 }

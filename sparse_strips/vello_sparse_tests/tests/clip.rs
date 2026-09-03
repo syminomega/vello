@@ -6,7 +6,6 @@
 use crate::renderer::Renderer;
 use crate::util::{circular_star, crossed_line_star, stops_green_blue};
 use std::f64::consts::PI;
-use vello_common::coarse::WideTile;
 use vello_common::color::palette::css::{
     BLACK, BLUE, DARK_BLUE, DARK_GREEN, GREEN, REBECCA_PURPLE, RED,
 };
@@ -18,26 +17,6 @@ use vello_cpu::peniko::{
     Gradient, LinearGradientPosition, RadialGradientPosition, SweepGradientPosition,
 };
 use vello_dev_macros::vello_test;
-
-#[vello_test(height = 8)]
-fn clip_single_wide_tile(ctx: &mut impl Renderer) {
-    const WIDTH: f64 = 100.0;
-    assert!(WIDTH <= WideTile::WIDTH as f64, "Width larger than a tile");
-    const HEIGHT: f64 = Tile::HEIGHT as f64;
-    const OFFSET: f64 = WIDTH / 3.0;
-
-    let colors = [RED, GREEN, BLUE];
-
-    for (i, color) in colors.iter().enumerate() {
-        let clip_rect = Rect::new((i as f64) * OFFSET, 0.0, WIDTH, HEIGHT);
-        ctx.push_clip_layer(&clip_rect.to_path(0.1));
-        ctx.set_paint(*color);
-        ctx.fill_rect(&Rect::new(0.0, 0.0, WIDTH, HEIGHT));
-    }
-    for _ in colors.iter() {
-        ctx.pop_layer();
-    }
-}
 
 #[vello_test(hybrid_tolerance = 1)]
 fn clip_triangle_with_star(ctx: &mut impl Renderer) {
@@ -370,13 +349,6 @@ fn clip_exceeding_viewport(ctx: &mut impl Renderer) {
     ctx.pop_layer();
 }
 
-// See <https://github.com/linebender/vello/pull/975#issuecomment-2858372366>
-#[vello_test(no_ref)]
-fn clip_completely_in_out_of_bounds_wide_tile(ctx: &mut impl Renderer) {
-    ctx.push_clip_layer(&Rect::new(300.0, 8.0, 350.0, 48.0).to_path(0.1));
-    ctx.pop_layer();
-}
-
 #[vello_test(width = 16, height = 16)]
 fn clip_non_isolated_outside_canvas(ctx: &mut impl Renderer) {
     // Should be completely clipped.
@@ -591,7 +563,7 @@ fn clip_with_sweep_gradient_fill(ctx: &mut impl Renderer) {
     ctx.pop_layer();
 }
 
-#[vello_test(width = 300, height = 30, skip_hybrid)]
+#[vello_test(width = 300, height = 30)]
 fn clip_layer_encloses_viewport_via_left_cull(ctx: &mut impl Renderer) {
     let clip = Rect::new(-100.0, -100.0, 400.0, 130.0).to_path(0.1);
 

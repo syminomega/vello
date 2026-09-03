@@ -37,68 +37,130 @@
 //!
 //! - `Scene`: Manages the render context and path processing on the CPU
 //! - `Renderer` or `WebGlRenderer`: Handles GPU resource management and executes draw operations
-//! - `Scheduler`: Manages and schedules draw operations on the renderer.
 //!
 //! See the individual module documentation for more details on usage and implementation.
+//!
+//! # Current state
+//!
+//! Vello Hybrid is a solid GPU-accelerated 2D renderer with broad, reliable
+//! feature support. Although it does not match Vello Classic's raw performance
+//! on dynamic and vector-heavy workloads, it provides excellent performance
+//! on workloads that benefit from GPU acceleration, such as images,
+//! gradients, and filters. Overall, we still consider it to be slightly less
+//! mature than its CPU-only counterpart Vello CPU.
+//!
+//! Vello Hybrid remains under active development. Known limitations include:
+//!
+//! - The following features are not yet supported and will panic: Mask layers,
+//!   complex filter graphs as well as certain blend modes for non-isolated
+//!   blending.
+//! - Parts of the API and its documentation are still suboptimal, for example
+//!   the lifecycle and ownership of external resources through [`Resources`][].
+//! - Some exposed features remain experimental and are not recommended for use,
+//!   including glyph caching. Experimental APIs are identified in their method
+//!   documentation.
+//! - Parts of the rendering pipeline are not yet fully optimized, particularly
+//!   the wgpu backend, but also other aspects.
+//! - Some failures panic instead of being reported through a user-facing error.
+//!
+//! With that said, we are continuously improving Vello Hybrid and will address
+//! these and other limitations in future releases.
 
 #![no_std]
+#![cfg_attr(
+    not(any(feature = "wgpu", feature = "webgl")),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "backend implementations are unused when none is enabled"
+    )
+)]
 
 extern crate alloc;
 
+pub(crate) mod blend;
+pub(crate) mod copy;
 pub(crate) mod filter;
 mod gradient_cache;
+mod paint;
+mod rect;
 mod render;
 mod resources;
-mod sampling;
 mod scene;
-#[cfg(any(feature = "webgl", feature = "wgpu"))]
 mod schedule;
+mod target;
 #[cfg(feature = "text")]
 mod text;
 
+pub(crate) mod draw;
 pub mod util;
 
+#[cfg(feature = "webgl")]
+pub use render::{
+    AtlasTextureInfo, WebGlAtlasWriter, WebGlRenderer, WebGlRendererInit, WebGlRendererInitStatus,
+    WebGlTextureBindings, WebGlTextureWithDimensions,
+};
 #[cfg(feature = "wgpu")]
 pub use render::{AtlasWriter, RenderTargetConfig, Renderer, TextureBindings};
 pub use render::{Config, GpuStrip, RenderSize};
 #[cfg(all(feature = "webgl", feature = "probe"))]
-pub use render::{Probe, ProbeResult};
-#[cfg(feature = "webgl")]
-pub use render::{WebGlAtlasWriter, WebGlRenderer, WebGlTextureWithDimensions};
+pub use render::{PROBE_ELEMENTS, Probe, ProbeFeature, ProbeResult, ProbeStatistics};
 #[cfg(all(feature = "webgl", feature = "probe"))]
 pub use render::{WebGlPendingProbe, WebGlProbeError, WebGlProbeStatus};
 pub use resources::Resources;
-pub use sampling::SampleRect;
-pub use scene::{RenderSettings, Scene, SceneConstraints};
+pub use scene::{LayersConfig, MemorySettings, RenderSettings, Scene};
 #[cfg(feature = "text")]
 pub use text::{GlyphRunBuilder, HybridGlyphRunBackend};
 pub use util::DimensionConstraints;
 pub use vello_common::TextureId;
+pub use vello_common::geometry::SizeU16;
 pub use vello_common::multi_atlas::{AllocationStrategy, AtlasConfig, AtlasId};
-pub use vello_common::pixmap::Pixmap;
+pub use vello_common::pixmap::{Pixels, Pixmap};
 
 use thiserror::Error;
 
 /// Errors that can occur during rendering.
 #[derive(Error, Debug, Clone)]
 pub enum RenderError {
-    /// No slots available for rendering.
-    ///
-    /// This error is likely to occur if a scene has an extreme number of nested layers
-    /// (clipping, blending, masks, or opacity layers).
-    ///
-    /// TODO: Consider supporting more than a single column of slots in slot textures.
-    #[error("No slots available for rendering")]
-    SlotsExhausted,
-    /// An allocation error occurred while trying to allocate a new image. This can happen
-    /// if the scene contains filter layers, which need space in the image atlas for intermediate
-    /// storage.
-    #[error("Filter atlas allocation failed: {0}")]
+    /// An image atlas allocation failed.
+    #[error("Atlas allocation failed: {0}")]
     AtlasError(#[from] vello_common::multi_atlas::AtlasError),
     /// A draw referenced a [`TextureId`] that was not provided at render time.
     #[error("Missing texture binding for {0:?}")]
     MissingTextureBinding(TextureId),
+    /// An intermediate texture allocation failed.
+    #[error(transparent)]
+    IntermediateTexture(#[from] IntermediateTextureError),
     // TODO: Consider expanding `RenderError` to replace some `.unwrap` and `.expect`.
+}
+
+/// Errors that can occur while allocating intermediate textures.
+#[derive(Error, Debug, Clone)]
+pub enum IntermediateTextureError {
+    /// An intermediate texture allocation exceeds the configured texture dimensions.
+    #[error(
+        "Intermediate texture allocation {width}x{height} exceeds maximum {max_width}x{max_height}"
+    )]
+    TooLarge {
+        /// The requested allocation width.
+        width: u32,
+        /// The requested allocation height.
+        height: u32,
+        /// The maximum intermediate texture width.
+        max_width: u16,
+        /// The maximum intermediate texture height.
+        max_height: u16,
+    },
+    /// A render requires more intermediate textures than configured.
+    #[error(
+        "Render requires {required} intermediate textures, exceeding the configured maximum of {max}"
+    )]
+    LimitReached {
+        /// The number of intermediate textures required by the render.
+        required: usize,
+        /// The configured maximum number of intermediate textures.
+        max: usize,
+    },
 }
 
 #[cfg(test)]

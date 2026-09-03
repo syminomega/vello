@@ -10,7 +10,28 @@ Subheadings to categorize changes are `added, changed, deprecated, removed, fixe
 
 ## [Unreleased]
 
+This release has an [MSRV][] of 1.89.
+
+### Added
+
+- `vello_encoding` is now re-exported from the `low_level` module. ([#1847][] by [@ChrisJr404][])
+
+## [0.10.0][] - 2026-08-14
+
 This release has an [MSRV][] of 1.88.
+
+### Added
+
+- Support for gradient interpolation in the unpremultiplied alpha space. ([#1268][] by [@sagudev][])
+
+### Changed
+
+- Updated Skrifa to v0.44.0. ([#1774][] by [@LaurenzV][])
+
+### Fixed
+
+- Rendering scenes whose binning requires more than 256 bins. ([#1700][] by [@b0nes164][])
+- Image textures are now explicitly destroyed when freed, releasing their GPU resources promptly. ([#1777][] by [@timon-schelling][])
 
 ## [0.9.0][] - 2026-05-15
 
@@ -308,7 +329,9 @@ This release has an [MSRV][] of 1.75.
 [@raphlinus]: https://github.com/raphlinus
 [@ArthurCose]: https://github.com/ArthurCose
 [@armansito]: https://github.com/armansito
+[@b0nes164]: https://github.com/b0nes164
 [@cfagot]: https://github.com/cfagot
+[@ChrisJr404]: https://github.com/ChrisJr404
 [@Cupnfish]: https://github.com/Cupnfish
 [@DasLixou]: https://github.com/DasLixou
 [@dfrg]: https://github.com/drfg
@@ -324,6 +347,7 @@ This release has an [MSRV][] of 1.75.
 [@ratmice]: https://github.com/ratmice
 [@sagudev]: https://github.com/sagudev
 [@simbleau]: https://github.com/simbleau
+[@timon-schelling]: https://github.com/timon-schelling
 [@songhuaixu]: https://github.com/songhuaixu
 [@StT191]: https://github.com/StT191
 [@TheNachoBIT]: https://github.com/TheNachoB
@@ -422,6 +446,7 @@ This release has an [MSRV][] of 1.75.
 [#1192]: https://github.com/linebender/vello/pull/1192
 [#1224]: https://github.com/linebender/vello/pull/1224
 [#1229]: https://github.com/linebender/vello/pull/1229
+[#1268]: https://github.com/linebender/vello/pull/1268
 [#1273]: https://github.com/linebender/vello/pull/1273
 [#1280]: https://github.com/linebender/vello/pull/1280
 [#1323]: https://github.com/linebender/vello/pull/1323
@@ -439,8 +464,13 @@ This release has an [MSRV][] of 1.75.
 [#1637]: https://github.com/linebender/vello/pull/1637
 [#1638]: https://github.com/linebender/vello/pull/1638
 [#1643]: https://github.com/linebender/vello/pull/1643
+[#1700]: https://github.com/linebender/vello/pull/1700
+[#1774]: https://github.com/linebender/vello/pull/1774
+[#1777]: https://github.com/linebender/vello/pull/1777
+[#1847]: https://github.com/linebender/vello/pull/1847
 
-[Unreleased]: https://github.com/linebender/vello/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/linebender/vello/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/linebender/vello/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/linebender/vello/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/linebender/vello/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/linebender/vello/compare/v0.6.0...v0.7.0

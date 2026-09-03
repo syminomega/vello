@@ -9,15 +9,18 @@
 )]
 #![cfg(target_arch = "wasm32")]
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::{cell::RefCell, rc::Rc};
 use vello_common::{
     fearless_simd::Level,
     kurbo::{Affine, Point},
     paint::{ImageId, ImageSource},
 };
-use vello_example_scenes::{AnyScene, image::ImageScene};
-use vello_hybrid::{AtlasConfig, Pixmap, RenderSettings, RenderTargetConfig, Renderer, Scene};
+use vello_example_scenes::{
+    AnyScene,
+    image::ImageScene,
+    performance::{FrameTiming, PerformancePanel, PerformanceStage, WebGlGpuTimer, now},
+};
+use vello_hybrid::{Pixmap, RenderSettings, RenderTargetConfig, Renderer, Scene};
 use wasm_bindgen::prelude::*;
 use web_sys::{Event, HtmlCanvasElement, KeyboardEvent, MouseEvent, WheelEvent};
 use wgpu::{
@@ -35,9 +38,12 @@ impl HasDisplayHandle for OurDisplayHandle {
 
 struct RendererWrapper {
     renderer: Renderer,
+    resources: vello_hybrid::Resources,
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
+    depth_texture_view: wgpu::TextureView,
+    gpu_timer: Option<WebGlGpuTimer>,
 }
 
 impl RendererWrapper {
@@ -88,29 +94,32 @@ impl RendererWrapper {
         };
         surface.configure(&device, &surface_config);
 
-        let max_texture_dimension_2d = device.limits().max_texture_dimension_2d;
-        let renderer = Renderer::new_with(
+        let settings = RenderSettings {
+            level: Level::try_detect().unwrap_or(Level::baseline()),
+            ..Default::default()
+        };
+        let (renderer, resources) = Renderer::new_with(
             &device,
             &RenderTargetConfig {
                 format: surface_format,
                 width,
                 height,
             },
-            RenderSettings {
-                level: Level::try_detect().unwrap_or(Level::baseline()),
-                atlas_config: AtlasConfig {
-                    atlas_size: (max_texture_dimension_2d, max_texture_dimension_2d),
-                    ..AtlasConfig::default()
-                },
-                ..Default::default()
-            },
+            settings,
+        );
+        let depth_texture_view = Renderer::create_depth_texture_view(
+            &device,
+            &vello_hybrid::RenderSize { width, height },
         );
 
         Self {
             renderer,
+            resources,
             device,
             queue,
             surface,
+            depth_texture_view,
+            gpu_timer: WebGlGpuTimer::new(&canvas),
         }
     }
 
@@ -126,13 +135,19 @@ impl RendererWrapper {
             view_formats: vec![],
         };
         self.surface.configure(&self.device, &surface_config);
+        self.depth_texture_view = Renderer::create_depth_texture_view(
+            &self.device,
+            &vello_hybrid::RenderSize { width, height },
+        );
+        if let Some(gpu_timer) = &mut self.gpu_timer {
+            gpu_timer.reset();
+        }
     }
 }
 
 /// State that handles scene rendering and interactions
 struct AppState {
     scenes: Box<[AnyScene<Scene>]>,
-    uploaded_scene_images: Box<[bool]>,
     current_scene: usize,
     scene: Scene,
     transform: Affine,
@@ -141,7 +156,7 @@ struct AppState {
     width: u32,
     height: u32,
     renderer_wrapper: RendererWrapper,
-    need_render: bool,
+    performance: PerformancePanel<3>,
     canvas: HtmlCanvasElement,
 }
 
@@ -149,14 +164,18 @@ impl AppState {
     async fn new(canvas: HtmlCanvasElement, scenes: Box<[AnyScene<Scene>]>) -> Self {
         let width = canvas.width();
         let height = canvas.height();
-        let uploaded_scene_images = vec![false; scenes.len()].into_boxed_slice();
+        let current_scene = initial_scene_index(scenes.len());
 
         let renderer_wrapper = RendererWrapper::new(canvas.clone()).await;
+        let timing_note = if renderer_wrapper.gpu_timer.is_some() {
+            "GPU queries are asynchronous and may arrive several frames later"
+        } else {
+            "GPU timing unavailable: EXT_disjoint_timer_query_webgl2 is unsupported"
+        };
 
         let mut app_state = Self {
             scenes,
-            uploaded_scene_images,
-            current_scene: 0,
+            current_scene,
             scene: Scene::new(width as u16, height as u16),
             transform: Affine::IDENTITY,
             mouse_down: false,
@@ -164,25 +183,54 @@ impl AppState {
             width,
             height,
             renderer_wrapper,
-            need_render: true,
+            performance: PerformancePanel::new(
+                "Vello Hybrid · wgpu → WebGL2",
+                [
+                    PerformanceStage {
+                        label: "Scene build",
+                        description: "CPU time to reset and populate the scene.",
+                        color: "#ef4444",
+                    },
+                    PerformanceStage {
+                        label: "Render/encode",
+                        description: "CPU time to encode the renderer's WebGL commands.",
+                        color: "#f59e0b",
+                    },
+                    PerformanceStage {
+                        label: "Submit/present",
+                        description: "CPU time to submit commands and present the surface; GPU completion is excluded.",
+                        color: "#3b82f6",
+                    },
+                ],
+                timing_note,
+            ),
             canvas,
         };
 
+        update_page_url(app_state.current_scene);
+        app_state.update_title();
         // Upload images to the WebGL atlas
         app_state.upload_images_to_atlas();
 
         app_state
     }
 
-    fn render(&mut self) {
-        if !self.need_render {
-            return;
-        }
-
+    fn render(&mut self) -> (Option<FrameTiming<3>>, Option<f64>) {
+        let gpu_time = self
+            .renderer_wrapper
+            .gpu_timer
+            .as_mut()
+            .and_then(WebGlGpuTimer::poll);
+        let frame_start = now();
         self.scene.reset();
 
         // Render the current scene with transform
-        self.scenes[self.current_scene].render(&mut self.scene, self.transform);
+        self.scenes[self.current_scene].render(
+            &mut self.scene,
+            &mut self.renderer_wrapper.resources,
+            self.transform,
+        );
+        let scene_end = now();
 
         let render_size = vello_hybrid::RenderSize {
             width: self.width,
@@ -195,7 +243,7 @@ impl AppState {
             | CurrentSurfaceTexture::Timeout
             | CurrentSurfaceTexture::Outdated
             | CurrentSurfaceTexture::Suboptimal(_) => {
-                return;
+                return (None, gpu_time);
             }
             CurrentSurfaceTexture::Lost => panic!("Surface was lost"),
             CurrentSurfaceTexture::Validation => {
@@ -211,24 +259,58 @@ impl AppState {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
+        if let Some(gpu_timer) = &mut self.renderer_wrapper.gpu_timer {
+            gpu_timer.begin();
+        }
         self.renderer_wrapper
             .renderer
             .render(
                 &self.scene,
-                self.scenes[self.current_scene].resources_mut(),
+                &mut self.renderer_wrapper.resources,
                 &self.renderer_wrapper.device,
                 &self.renderer_wrapper.queue,
                 &mut encoder,
                 &render_size,
                 &surface_texture_view,
+                Some(&self.renderer_wrapper.depth_texture_view),
                 &vello_hybrid::TextureBindings::new(),
             )
             .unwrap();
+        let render_end = now();
 
         self.renderer_wrapper.queue.submit([encoder.finish()]);
         surface_texture.present();
+        if let Some(gpu_timer) = &mut self.renderer_wrapper.gpu_timer {
+            gpu_timer.end();
+        }
+        let frame_end = now();
 
-        self.need_render = false;
+        (
+            Some(FrameTiming {
+                stages_ms: [
+                    scene_end - frame_start,
+                    render_end - scene_end,
+                    frame_end - render_end,
+                ],
+                total_ms: frame_end - frame_start,
+            }),
+            gpu_time,
+        )
+    }
+
+    fn frame(&mut self, timestamp: f64) {
+        let (timing, gpu_time) = self.render();
+        let scene = self.current_scene + 1;
+        let scene_count = self.scenes.len();
+        self.performance.record_gpu_time(gpu_time);
+        self.performance.record(
+            timestamp,
+            timing,
+            scene,
+            scene_count,
+            self.width,
+            self.height,
+        );
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -237,17 +319,20 @@ impl AppState {
         self.width = width;
         self.height = height;
 
-        self.scene = Scene::new(width as u16, height as u16);
+        self.scene.reset_and_resize(width as u16, height as u16);
         self.renderer_wrapper.resize(width, height);
-
-        self.need_render = true;
+        self.performance.reset();
     }
 
     fn next_scene(&mut self) {
         self.current_scene = (self.current_scene + 1) % self.scenes.len();
-        self.upload_images_to_atlas();
+        update_page_url(self.current_scene);
+        self.update_title();
         self.transform = Affine::IDENTITY;
-        self.need_render = true;
+        if let Some(gpu_timer) = &mut self.renderer_wrapper.gpu_timer {
+            gpu_timer.reset();
+        }
+        self.performance.reset();
     }
 
     fn prev_scene(&mut self) {
@@ -256,21 +341,34 @@ impl AppState {
         } else {
             self.current_scene - 1
         };
-        self.upload_images_to_atlas();
+        update_page_url(self.current_scene);
+        self.update_title();
         self.transform = Affine::IDENTITY;
-        self.need_render = true;
+        if let Some(gpu_timer) = &mut self.renderer_wrapper.gpu_timer {
+            gpu_timer.reset();
+        }
+        self.performance.reset();
+    }
+
+    fn update_title(&self) {
+        web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .set_title(&format!(
+                "Vello Hybrid WGPU WebGL - Page {}/{}",
+                self.current_scene + 1,
+                self.scenes.len()
+            ));
     }
 
     fn reset_transform(&mut self) {
         self.transform = Affine::IDENTITY;
-        self.need_render = true;
     }
 
     fn handle_key(&mut self, key: &str) {
-        if let Some(scene) = self.scenes.get_mut(self.current_scene)
-            && scene.handle_key(key)
-        {
-            self.need_render = true;
+        if let Some(scene) = self.scenes.get_mut(self.current_scene) {
+            scene.handle_key(key);
         }
     }
 
@@ -291,7 +389,6 @@ impl AppState {
             && let Some(last_pos) = self.last_cursor_position
         {
             self.transform = self.transform.then_translate(current_pos - last_pos);
-            self.need_render = true;
         }
 
         self.last_cursor_position = Some(current_pos);
@@ -309,15 +406,9 @@ impl AppState {
                 y: 0.5 * self.height as f64,
             }),
         );
-
-        self.need_render = true;
     }
 
     fn upload_images_to_atlas(&mut self) {
-        if self.uploaded_scene_images[self.current_scene] {
-            return;
-        }
-
         let mut encoder =
             self.renderer_wrapper
                 .device
@@ -328,7 +419,7 @@ impl AppState {
         // 1st example — uploading pixmap directly to WebGL atlas
         let pixmap1 = ImageScene::read_flower_image();
         self.renderer_wrapper.renderer.upload_image(
-            self.scenes[self.current_scene].resources_mut(),
+            &mut self.renderer_wrapper.resources,
             &self.renderer_wrapper.device,
             &self.renderer_wrapper.queue,
             &mut encoder,
@@ -343,7 +434,7 @@ impl AppState {
             &pixmap2,
         );
         self.renderer_wrapper.renderer.upload_image(
-            self.scenes[self.current_scene].resources_mut(),
+            &mut self.renderer_wrapper.resources,
             &self.renderer_wrapper.device,
             &self.renderer_wrapper.queue,
             &mut encoder,
@@ -351,7 +442,6 @@ impl AppState {
         );
 
         self.renderer_wrapper.queue.submit([encoder.finish()]);
-        self.uploaded_scene_images[self.current_scene] = true;
     }
 
     fn upload_image_to_texture(
@@ -408,7 +498,7 @@ impl AppState {
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_name = requestAnimationFrame)]
-    fn request_animation_frame(f: &Closure<dyn FnMut()>);
+    fn request_animation_frame(f: &Closure<dyn FnMut(f64)>);
 }
 
 /// Creates a `HTMLCanvasElement` of the given dimensions and renders the given scenes into it,
@@ -454,14 +544,14 @@ pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
 
     // Set up animation frame loop
     {
-        let f = Rc::new(RefCell::new(None));
+        let f = Rc::new(RefCell::new(None::<Closure<dyn FnMut(f64)>>));
         let g = f.clone();
         let app_state = app_state.clone();
 
-        *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {
-            app_state.borrow_mut().render();
+        *g.borrow_mut() = Some(Closure::wrap(Box::new(move |timestamp: f64| {
+            app_state.borrow_mut().frame(timestamp);
             request_animation_frame(f.borrow().as_ref().unwrap());
-        }) as Box<dyn FnMut()>));
+        }) as Box<dyn FnMut(f64)>));
 
         request_animation_frame(g.borrow().as_ref().unwrap());
     }
@@ -613,9 +703,12 @@ pub async fn render_scene(scene: Scene, width: u16, height: u16) {
 
     let RendererWrapper {
         mut renderer,
+        mut resources,
         device,
         queue,
         surface,
+        depth_texture_view,
+        ..
     } = RendererWrapper::new(canvas).await;
 
     let render_size = vello_hybrid::RenderSize {
@@ -632,7 +725,6 @@ pub async fn render_scene(scene: Scene, width: u16, height: u16) {
 
     let mut encoder =
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-    let mut resources = vello_hybrid::Resources::new();
 
     renderer
         .render(
@@ -643,10 +735,34 @@ pub async fn render_scene(scene: Scene, width: u16, height: u16) {
             &mut encoder,
             &render_size,
             &surface_texture_view,
+            Some(&depth_texture_view),
             &vello_hybrid::TextureBindings::new(),
         )
         .unwrap();
 
     queue.submit([encoder.finish()]);
     surface_texture.present();
+}
+
+fn initial_scene_index(scene_count: usize) -> usize {
+    web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
+        .and_then(|params| params.get("page"))
+        .and_then(|page| page.parse::<usize>().ok())
+        .filter(|page| (1..=scene_count).contains(page))
+        .map_or(0, |page| page - 1)
+}
+
+fn update_page_url(scene_index: usize) {
+    web_sys::window()
+        .unwrap()
+        .history()
+        .unwrap()
+        .replace_state_with_url(
+            &JsValue::NULL,
+            "",
+            Some(&format!("?page={}", scene_index + 1)),
+        )
+        .unwrap();
 }

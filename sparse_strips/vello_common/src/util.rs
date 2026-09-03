@@ -4,14 +4,12 @@
 //! Utility functions.
 
 use crate::geometry::RectU16;
-use crate::kurbo::PathEl;
-use crate::math::FloatExt;
+use crate::math::{FloatExt, snap_up};
+use crate::strip::{Strip, visit_strip_fill_segments};
 use crate::tile::Tile;
 use alloc::vec::Vec;
 use core::ops::{Index, IndexMut};
-use fearless_simd::{
-    Bytes, Simd, SimdBase, SimdFloat, f32x16, u8x16, u8x32, u16x16, u16x32, u32x16,
-};
+use fearless_simd::{f32x16, prelude::*, u8x16, u32x16};
 #[cfg(not(feature = "std"))]
 use peniko::kurbo::common::FloatFuncs as _;
 use peniko::kurbo::{Affine, Rect};
@@ -31,45 +29,99 @@ pub fn f32_to_u8<S: Simd>(val: f32x16<S>) -> u8x16<S> {
     let (p1, p2) = simd.split_u8x32(x8_1);
     let (p3, p4) = simd.split_u8x32(x8_2);
 
-    let uzp1 = simd.unzip_low_u8x16(p1, p2);
-    let uzp2 = simd.unzip_low_u8x16(p3, p4);
-    simd.unzip_low_u8x16(uzp1, uzp2)
+    #[cfg(target_endian = "little")]
+    let result = {
+        let uzp1 = simd.unzip_low_u8x16(p1, p2);
+        let uzp2 = simd.unzip_low_u8x16(p3, p4);
+
+        simd.unzip_low_u8x16(uzp1, uzp2)
+    };
+
+    #[cfg(target_endian = "big")]
+    let result = {
+        let uzp1 = simd.unzip_high_u8x16(p1, p2);
+        let uzp2 = simd.unzip_high_u8x16(p3, p4);
+
+        simd.unzip_high_u8x16(uzp1, uzp2)
+    };
+
+    result
 }
 
 /// A trait for implementing a fast approximal division by 255 for integers.
-pub trait Div255Ext {
+pub trait Div255Ext: private::Sealed {
     /// Divide by 255.
     fn div_255(self) -> Self;
 }
 
-impl<S: Simd> Div255Ext for u16x32<S> {
+mod private {
+    use fearless_simd::{Simd, u16x16, u16x32};
+
+    #[expect(unnameable_types, reason = "Sealed trait pattern.")]
+    pub trait Sealed {}
+
+    impl<S: Simd> Sealed for u16x16<S> {}
+    impl<S: Simd> Sealed for u16x32<S> {}
+}
+
+/// Widen a SIMD vector and combine the two widened halves into one vector.
+#[inline(always)]
+pub fn widen<S, V>(value: V) -> <V::Widened as SimdCombine<S>>::Combined
+where
+    S: Simd,
+    V: SimdWiden<S>,
+    V::Widened: SimdCombine<S>,
+{
+    let (low, high) = value.widen();
+    low.combine(high)
+}
+
+/// Split a SIMD vector and narrow its two halves into one vector.
+#[inline(always)]
+pub fn narrow<S, V>(value: V) -> <V::Split as SimdNarrow<S>>::Narrowed
+where
+    S: Simd,
+    V: SimdSplit<S>,
+    V::Split: SimdNarrow<S>,
+{
+    let (low, high) = value.split();
+    low.narrow(high)
+}
+
+/// Split a SIMD vector and narrow its two halves with saturation.
+#[inline(always)]
+pub fn saturating_narrow<S, V>(value: V) -> <V::Split as SimdNarrow<S>>::Narrowed
+where
+    S: Simd,
+    V: SimdSplit<S>,
+    V::Split: SimdNarrow<S>,
+{
+    let (low, high) = value.split();
+    low.saturating_narrow(high)
+}
+
+impl<T> Div255Ext for T
+where
+    T: private::Sealed + core::ops::Add<u16, Output = T> + core::ops::Shr<u32, Output = T>,
+{
     #[inline(always)]
     fn div_255(self) -> Self {
-        let p1 = Self::splat(self.simd, 255);
-        let p2 = self + p1;
-        p2 >> 8
+        (self + 255_u16) >> 8_u32
     }
 }
 
-impl<S: Simd> Div255Ext for u16x16<S> {
-    #[inline(always)]
-    fn div_255(self) -> Self {
-        let p1 = Self::splat(self.simd, 255);
-        let p2 = self + p1;
-        p2 >> 8
-    }
-}
-
-/// Perform a normalized multiplication for u8x32.
+/// Perform a normalized multiplication for a SIMD vector of `u8` values.
 #[inline(always)]
-pub fn normalized_mul_u8x32<S: Simd>(a: u8x32<S>, b: u8x32<S>) -> u16x32<S> {
-    (S::widen_u8x32(a.simd, a) * S::widen_u8x32(b.simd, b)).div_255()
-}
-
-/// Perform a normalized multiplication for u8x16.
-#[inline(always)]
-pub fn normalized_mul_u8x16<S: Simd>(a: u8x16<S>, b: u8x16<S>) -> u16x16<S> {
-    (S::widen_u8x16(a.simd, a) * S::widen_u8x16(b.simd, b)).div_255()
+pub fn normalized_mul_u8<S, V>(a: V, b: V) -> <V::Widened as SimdCombine<S>>::Combined
+where
+    S: Simd,
+    V: SimdWiden<S>,
+    V::Widened: SimdCombine<S>,
+    <V::Widened as SimdCombine<S>>::Combined: Div255Ext,
+{
+    let a = widen(a);
+    let b = widen(b);
+    (a * b).div_255()
 }
 
 /// Check if an affine transform is a pure integer translation.
@@ -139,9 +191,16 @@ pub trait RectExt {
 impl RectExt for Rect {
     #[inline]
     fn snap_to_tile_coordinates(self) -> Self {
+        let x0 = snap_down(self.x0, Tile::WIDTH);
+        let y0 = snap_down(self.y0, Tile::HEIGHT);
+
+        if self.is_zero_area() {
+            return Self::new(x0, y0, x0, y0);
+        }
+
         Self::new(
-            snap_down(self.x0, Tile::WIDTH),
-            snap_down(self.y0, Tile::HEIGHT),
+            x0,
+            y0,
             snap_up(self.x1, Tile::WIDTH),
             snap_up(self.y1, Tile::HEIGHT),
         )
@@ -151,15 +210,21 @@ impl RectExt for Rect {
 impl RectExt for RectU16 {
     #[inline]
     fn snap_to_tile_coordinates(self) -> Self {
+        // This method will panic if we have a viewport of size u16::MAX and draw
+        // at the very edge, but better than returning a wrong result.
+
+        let x0 = (self.x0 / Tile::WIDTH).checked_mul(Tile::WIDTH).unwrap();
+        let y0 = (self.y0 / Tile::HEIGHT).checked_mul(Tile::HEIGHT).unwrap();
+
+        if self.is_empty() {
+            return Self::new(x0, y0, x0, y0);
+        }
+
         Self::new(
-            (self.x0 / Tile::WIDTH) * Tile::WIDTH,
-            (self.y0 / Tile::HEIGHT) * Tile::HEIGHT,
-            self.x1
-                .checked_next_multiple_of(Tile::WIDTH)
-                .unwrap_or(u16::MAX),
-            self.y1
-                .checked_next_multiple_of(Tile::HEIGHT)
-                .unwrap_or(u16::MAX),
+            x0,
+            y0,
+            self.x1.checked_next_multiple_of(Tile::WIDTH).unwrap(),
+            self.y1.checked_next_multiple_of(Tile::HEIGHT).unwrap(),
         )
     }
 }
@@ -170,17 +235,67 @@ fn snap_down(value: f64, step: u16) -> f64 {
     (value / step).floor() * step
 }
 
-#[inline]
-fn snap_up(value: f64, step: u16) -> f64 {
-    let step = f64::from(step);
-    (value / step).ceil() * step
-}
-
 /// A type that can be cleared.
 pub trait Clear {
     /// Clear the object to its default state.
     fn clear(&mut self);
 }
+
+impl<T> Clear for Vec<T> {
+    fn clear(&mut self) {
+        Self::clear(self);
+    }
+}
+
+/// Pool for reusing allocations.
+#[derive(Debug)]
+pub struct Pool<T> {
+    entries: Vec<T>,
+    clear_on_submit: bool,
+}
+
+impl<T> Default for Pool<T> {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
+
+impl<T> Pool<T> {
+    /// Create a new pool.
+    ///
+    /// `clear_on_submit` decides whether submitted values should
+    /// be cleared when they are submitted or whether they should retain
+    /// their original contents.
+    pub fn new(clear_on_submit: bool) -> Self {
+        Self {
+            entries: Vec::new(),
+            clear_on_submit,
+        }
+    }
+
+    /// Take an object from the pool or create a new one.
+    pub fn take(&mut self) -> T
+    where
+        T: Default,
+    {
+        self.entries.pop().unwrap_or_default()
+    }
+
+    /// Return an object to the pool.
+    pub fn submit(&mut self, mut entry: T)
+    where
+        T: Clear,
+    {
+        if self.clear_on_submit {
+            entry.clear();
+        }
+
+        self.entries.push(entry);
+    }
+}
+
+/// Pool for reusing vector allocations.
+pub type VecPool<T> = Pool<Vec<T>>;
 
 /// A resizable vector that retains inner elements upon resizing.
 #[derive(Debug)]
@@ -273,60 +388,180 @@ impl<T> IndexMut<usize> for RetainVec<T> {
     }
 }
 
-/// Compute a conservative bounding box for the transformed path by computing the bounding box of
-/// the transformed control points.
-///
-/// If `path` is empty, this returns an infinite, inversed [`Rect`] (`left` > `right` and `top` > `bottom`).
-pub fn control_point_bbox(path: impl IntoIterator<Item = PathEl>, transform: Affine) -> Rect {
-    // Start with an infinite, inversed rectangle. Adding the first point immediately collapses it
-    // without branching.
-    let mut bbox = Rect::new(
-        f64::INFINITY,
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-        f64::NEG_INFINITY,
+/// Calculate the bounding box of the strips.
+pub fn strip_bbox(strips: &[Strip]) -> Option<RectU16> {
+    // Fill and alpha fill segments internally store their coordinates in tile units,
+    // in order to avoid multiplications in every invocation of the closure we calculate
+    // the bbox in tile units first and then convert back to pixel units.
+    let mut tile_bbox = RectU16::INVERTED;
+
+    visit_strip_fill_segments(
+        strips,
+        RectU16::new(
+            0,
+            0,
+            u16::MAX.div_ceil(Tile::WIDTH),
+            u16::MAX.div_ceil(Tile::HEIGHT),
+        ),
+        &mut tile_bbox,
+        |bbox, segment| bbox.union(segment.fill.tile_rect()),
+        |bbox, segment| bbox.union(segment.tile_rect()),
     );
-    for el in path {
-        match el {
-            PathEl::MoveTo(p) | PathEl::LineTo(p) => {
-                bbox = bbox.union_pt(transform * p);
-            }
-            PathEl::QuadTo(p1, p2) => {
-                bbox = bbox.union_pt(transform * p1);
-                bbox = bbox.union_pt(transform * p2);
-            }
-            PathEl::CurveTo(p1, p2, p3) => {
-                bbox = bbox.union_pt(transform * p1);
-                bbox = bbox.union_pt(transform * p2);
-                bbox = bbox.union_pt(transform * p3);
-            }
-            PathEl::ClosePath => {}
-        }
+
+    // Convert to pixel units.
+    if tile_bbox.is_empty() {
+        None
+    } else {
+        Some(RectU16::new(
+            tile_bbox.x0.checked_mul(Tile::WIDTH).unwrap(),
+            tile_bbox.y0.checked_mul(Tile::HEIGHT).unwrap(),
+            tile_bbox.x1.checked_mul(Tile::WIDTH).unwrap(),
+            tile_bbox.y1.checked_mul(Tile::HEIGHT).unwrap(),
+        ))
     }
-    bbox
 }
 
-/// Compute a conservative bounding box for the transformed path in pixel coordinates.
-///
-/// If `path` is empty, this returns an inverted [`RectU16`].
-pub fn control_point_bbox_u16(
-    path: impl IntoIterator<Item = PathEl>,
-    transform: Affine,
-) -> RectU16 {
-    let bbox = control_point_bbox(path, transform);
-    RectU16::new(
-        bbox.x0 as u16,
-        bbox.y0 as u16,
-        bbox.x1.ceil() as u16,
-        bbox.y1.ceil() as u16,
-    )
+pub(crate) mod unpremultiply {
+    use fearless_simd::{prelude::*, u8x16, u16x16};
+
+    trait Div256Ext {
+        /// Divide by 256, rounding to the nearest integer.
+        ///
+        /// Values must not exceed `u16::MAX - 128`.
+        fn div_256(self) -> Self;
+    }
+
+    impl<T> Div256Ext for T
+    where
+        T: core::ops::Add<u16, Output = T> + core::ops::Shr<u32, Output = T>,
+    {
+        #[inline(always)]
+        fn div_256(self) -> Self {
+            (self + 128_u16) >> 8_u32
+        }
+    }
+
+    // Unlike premultiplication, unpremultiplication is difficult to perform
+    // efficiently with SIMD because the divisor varies for each pixel.
+    // Premultiplication computes `rgb * alpha / 255`, while
+    // unpremultiplication computes `rgb * 255 / alpha`.
+    //
+    // Therefore, what we do instead is that we precompute the reciprocal
+    // 255 / alpha for each possible alpha value such that the
+    // computation simply becomes rgb * reciprocal. We do this using fixed-point
+    // artithmetic with 8 fractional digits, hence why we need to multiply and
+    // divide by 256.
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "all generated reciprocals fit into a u16"
+    )]
+    const fn reciprocals() -> [u16; 256] {
+        let mut values = [0; 256];
+
+        // When alpha is 0, so are the RGB channels so it just stays
+        // 0.
+        let mut alpha = 1;
+
+        while alpha < 256 {
+            let round_factor = alpha / 2;
+            values[alpha] = ((255 * 256 + round_factor) / alpha) as u16;
+            alpha += 1;
+        }
+
+        values
+    }
+
+    const RECIPROCALS: [u16; 256] = reciprocals();
+
+    #[inline(always)]
+    pub(crate) const fn reciprocal(alpha: u8) -> u16 {
+        RECIPROCALS[alpha as usize]
+    }
+
+    #[inline(always)]
+    pub(crate) fn scalar(component: u8, reciprocal: u16) -> u8 {
+        u16::from(component).wrapping_mul(reciprocal).div_256() as u8
+    }
+
+    #[inline(always)]
+    pub(crate) fn simd<S: Simd>(_simd: S, component: u8x16<S>, reciprocal: u16x16<S>) -> u8x16<S> {
+        let component = super::widen(component);
+        let product = (component * reciprocal).div_256();
+        super::narrow(product)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use fearless_simd::{Level, SimdBase, dispatch, u8x16, u16x16};
+
+        use super::{reciprocal, scalar, simd as unpremultiply_simd};
+
+        fn assert_accurate(component: u8, alpha: u8, actual: u8) {
+            // For 0 and 255 we want exact matches, otherwise we tolerate
+            // a delta of at most 1 compared to f32.
+
+            if component == 0 || alpha == 0 || alpha == 255 {
+                assert_eq!(actual, component);
+            } else if component == alpha {
+                assert_eq!(actual, 255);
+            } else {
+                let expected = (f32::from(component) * 255.0 / f32::from(alpha) + 0.5) as u8;
+
+                assert!(
+                    actual.abs_diff(expected) <= 1,
+                    "component {component} with alpha {alpha} produced {actual} instead of {expected}"
+                );
+            }
+        }
+
+        #[test]
+        fn scalar_exhaustive() {
+            for alpha in 0_u8..=255 {
+                for component in 0_u8..=alpha {
+                    assert_accurate(component, alpha, scalar(component, reciprocal(alpha)));
+                }
+            }
+        }
+
+        #[test]
+        fn simd_exhaustive() {
+            let level = Level::try_detect().unwrap_or(Level::baseline());
+
+            dispatch!(level, simd => {
+                for alpha in 0_u8..=255 {
+                    let alpha_simd = u8x16::splat(simd, alpha);
+                    let reciprocal =
+                        u16x16::from_fn(simd, |lane| reciprocal(alpha_simd[lane]));
+
+                    for component_start in (0_u16..=u16::from(alpha)).step_by(16) {
+                        let component = u8x16::from_fn(simd, |lane| {
+                            (component_start + lane as u16).min(u16::from(alpha)) as u8
+                        });
+                        let actual = unpremultiply_simd(simd, component, reciprocal);
+
+                        for lane in 0..16 {
+                            let component = component[lane];
+                            assert_accurate(component, alpha, actual[lane]);
+                        }
+                    }
+                }
+            });
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::RectExt;
     use super::RectU16;
+    use super::{RectExt, strip_bbox};
+    use crate::strip::Strip;
+    use crate::tile::Tile;
     use peniko::kurbo::Rect;
+
+    fn sentinel(y: u16, alpha_idx: u32) -> Strip {
+        Strip::new(u16::MAX, y, alpha_idx, false)
+    }
 
     #[test]
     fn snap_to_tile_coordinates_rounds_outward() {
@@ -338,5 +573,67 @@ mod tests {
     fn snap_u16_to_tile_coordinates_rounds_outward() {
         let rect = RectU16::new(5, 3, 9, 7).snap_to_tile_coordinates();
         assert_eq!(rect, RectU16::new(4, 0, 12, 8));
+    }
+
+    #[test]
+    fn snap_to_tile_coordinates_preserves_empty_rects() {
+        assert_eq!(
+            Rect::new(5.0, 3.0, 5.0, 7.0).snap_to_tile_coordinates(),
+            Rect::new(4.0, 0.0, 4.0, 0.0)
+        );
+        assert_eq!(
+            RectU16::new(5, 3, 9, 3).snap_to_tile_coordinates(),
+            RectU16::new(4, 0, 4, 0)
+        );
+    }
+
+    #[test]
+    fn empty_strip_bbox() {
+        let strips = [Strip::sentinel(0, 0)];
+
+        assert_eq!(strip_bbox(&strips), None);
+    }
+
+    #[test]
+    fn single_strip_bbox() {
+        let strips = [
+            Strip::new(8, 4, 0, false),
+            sentinel(4, u32::from(Tile::HEIGHT) * 4),
+        ];
+
+        assert_eq!(strip_bbox(&strips), Some(RectU16::new(8, 4, 12, 8)));
+    }
+
+    #[test]
+    fn strip_with_fill_bbox() {
+        let strips = [
+            Strip::new(4, 0, 0, false),
+            Strip::new(20, 0, u32::from(Tile::HEIGHT) * 4, true),
+            sentinel(0, u32::from(Tile::HEIGHT) * 8),
+        ];
+
+        assert_eq!(strip_bbox(&strips), Some(RectU16::new(4, 0, 24, 4)));
+    }
+
+    #[test]
+    fn strip_with_row_end_fill_gap_bbox_is_clamped_to_viewport() {
+        let strips = [
+            Strip::new(4, 0, 0, false),
+            Strip::new(32, 0, u32::from(Tile::HEIGHT) * 4, true),
+            sentinel(0, u32::from(Tile::HEIGHT) * 4),
+        ];
+
+        assert_eq!(strip_bbox(&strips), Some(RectU16::new(4, 0, 32, 4)));
+    }
+
+    #[test]
+    fn strips_with_multiple_rows_bbox() {
+        let strips = [
+            Strip::new(12, 0, 0, false),
+            Strip::new(4, 8, u32::from(Tile::HEIGHT) * 4, false),
+            sentinel(8, u32::from(Tile::HEIGHT) * 8),
+        ];
+
+        assert_eq!(strip_bbox(&strips), Some(RectU16::new(4, 0, 16, 12)));
     }
 }

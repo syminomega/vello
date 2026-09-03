@@ -1,6 +1,6 @@
 [package]
 name = "vello_hybrid"
-version = "0.0.9"
+version = "0.2.0"
 description = "A hybrid CPU/GPU renderer for Vello, balancing computation between CPU and GPU for efficiency."
 categories = ["rendering", "graphics"]
 keywords = ["2d", "vector-graphics"]
@@ -24,8 +24,8 @@ vello_sparse_shaders = { workspace = true, optional = true }
 log = { workspace = true }
 hashbrown = { workspace = true }
 
-js-sys = { version = "0.3.98", optional = true }
-web-sys = { version = "0.3.98", features = [
+js-sys = { workspace = true, optional = true }
+web-sys = { workspace = true, features = [
     "HtmlCanvasElement",
     "WebGl2RenderingContext",
     "WebGlContextAttributes",
@@ -48,7 +48,7 @@ roxmltree = "0.20.0"
 
 [features]
 default = ["wgpu", "wgpu_default", "text"]
-std = ["wgpu", "vello_common/std", "glifo?/std"]
+std = ["vello_common/std", "glifo?/std"]
 libm = ["vello_common/libm", "glifo?/libm"]
 wgpu = ["dep:wgpu", "dep:vello_sparse_shaders"]
 # Enable wgpu with its default features. If you need to customise the set of enabled wgpu features,

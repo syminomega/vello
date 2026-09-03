@@ -11,6 +11,8 @@ use vello_common::image_cache::ImageCache;
 use vello_common::multi_atlas::AtlasConfig;
 
 /// Persistent resources required by Vello Hybrid for rendering.
+///
+/// A set of resources must only be used with the renderer instance associated with it.
 #[derive(Debug)]
 pub struct Resources {
     pub(crate) image_cache: ImageCache,
@@ -21,21 +23,14 @@ pub struct Resources {
 }
 
 impl Resources {
-    /// Create a new set of renderer resources.
-    pub fn new() -> Self {
+    pub(crate) fn new(image_atlas_config: AtlasConfig) -> Self {
         Self {
-            image_cache: ImageCache::new_with_config(AtlasConfig::default()),
+            image_cache: ImageCache::new_with_config(image_atlas_config),
             #[cfg(feature = "text")]
             glyph_prep_cache: GlyphPrepCache::default(),
             // Will be initialized lazily.
             #[cfg(feature = "text")]
             glyph_resources: None,
         }
-    }
-}
-
-impl Default for Resources {
-    fn default() -> Self {
-        Self::new()
     }
 }

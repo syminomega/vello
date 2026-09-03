@@ -24,7 +24,11 @@ pub(crate) struct ReflectionMap {
 
 impl ReflectionMap {
     /// Create a new `ReflectionMap` given the [`naga`] compile info.
-    pub(crate) fn new(info: ReflectionInfo, global_vars: &Arena<GlobalVariable>) -> Self {
+    pub(crate) fn new(
+        info: ReflectionInfo,
+        global_vars: &Arena<GlobalVariable>,
+        original_global_names: &BTreeMap<String, String>,
+    ) -> Self {
         debug_assert_eq!(info.varying.len(), 0, "unimplemented");
         debug_assert_eq!(info.immediates_items.len(), 0, "unimplemented");
         let mut texture_mapping = BTreeMap::default();
@@ -34,7 +38,13 @@ impl ReflectionMap {
             if let Ok(wgsl_var) = global_vars.try_get(texture_handles.texture)
                 && let Some(wgsl_name) = &wgsl_var.name
             {
-                texture_mapping.insert(wgsl_name.clone(), glsl_name);
+                texture_mapping.insert(
+                    original_global_names
+                        .get(wgsl_name)
+                        .unwrap_or(wgsl_name)
+                        .clone(),
+                    glsl_name,
+                );
             }
         }
 
@@ -42,7 +52,13 @@ impl ReflectionMap {
             if let Ok(wgsl_var) = global_vars.try_get(handle)
                 && let Some(wgsl_name) = &wgsl_var.name
             {
-                uniforms.insert(wgsl_name.clone(), glsl_name);
+                uniforms.insert(
+                    original_global_names
+                        .get(wgsl_name)
+                        .unwrap_or(wgsl_name)
+                        .clone(),
+                    glsl_name,
+                );
             }
         }
 
@@ -77,7 +93,7 @@ impl CompiledGlsl {
     /// identifier mappings are also generated from the wgsl identifier to the compiled naga
     /// identifier.
     pub(crate) fn to_generated_code(&self, shader_name: &str) -> String {
-        let mut code = format!("/// Compiled glsl for `{shader_name}.wgsl`\n");
+        let mut code = format!("/// Compiled GLSL for `{shader_name}.wesl`.\n");
         code.push_str(&format!("pub mod {shader_name} {{\n"));
         code.push_str(r#"    #![allow(missing_docs, reason="No metadata to generate precise documentation for generated code.")]"#);
         code.push_str("\n\n");
@@ -227,7 +243,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         .unwrap();
         let reflection_info = w.write().unwrap();
 
-        let result = ReflectionMap::new(reflection_info, &module.global_variables);
+        let result = ReflectionMap::new(
+            reflection_info,
+            &module.global_variables,
+            &std::collections::BTreeMap::default(),
+        );
 
         // Assertions
         assert_eq!(result.uniforms.len(), 1);
@@ -268,7 +288,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         .unwrap();
         let reflection_info = w.write().unwrap();
 
-        let result = ReflectionMap::new(reflection_info, &module.global_variables);
+        let result = ReflectionMap::new(
+            reflection_info,
+            &module.global_variables,
+            &std::collections::BTreeMap::default(),
+        );
         // Assertions
         assert_eq!(result.uniforms.len(), 1);
         assert_eq!(

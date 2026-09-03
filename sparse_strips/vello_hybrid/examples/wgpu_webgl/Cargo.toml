@@ -16,15 +16,18 @@ workspace = true
 [dependencies]
 console_error_panic_hook = { workspace = true }
 console_log = { workspace = true }
-js-sys = "0.3.98"
+js-sys = { workspace = true }
 log = { workspace = true }
 vello_common = { workspace = true }
 vello_hybrid = { workspace = true }
-vello_example_scenes = { workspace = true }
-wasm-bindgen = "0.2.121"
-wasm-bindgen-futures = "0.4.71"
-web-sys = { version = "0.3.98", features = [
+vello_example_scenes = { workspace = true, features = ["webgl_gpu_timing"] }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+web-sys = { workspace = true, features = [
     "Window",
+    "Location",
+    "History",
+    "UrlSearchParams",
     "Document",
     "Element",
     "HtmlElement",
@@ -38,4 +41,4 @@ web-sys = { version = "0.3.98", features = [
 wgpu = { workspace = true, default-features = true, features = ["webgl"] }
 
 [dev-dependencies]
-wasm-bindgen-test = "0.3.71"
+wasm-bindgen-test = { workspace = true }

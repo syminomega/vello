@@ -12,6 +12,12 @@ workspace = true
 [features]
 default = []
 cpu = ["dep:vello_cpu"]
+webgl_gpu_timing = [
+    "web-sys/ExtDisjointTimerQuery",
+    "web-sys/HtmlCanvasElement",
+    "web-sys/WebGl2RenderingContext",
+    "web-sys/WebGlQuery",
+]
 
 [dependencies]
 bytemuck = { workspace = true, features = [] }
@@ -27,7 +33,17 @@ console_log = { workspace = true }
 log = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-parley = { version = "0.9.0", default-features = false, features = ["std"] }
+parley = { version = "0.11.0", default-features = false, features = ["std"] }
+wasm-bindgen = { workspace = true }
+web-sys = { workspace = true, features = [
+    "Window",
+    "Performance",
+    "Document",
+    "Node",
+    "Element",
+    "HtmlElement",
+    "CssStyleDeclaration",
+] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-parley = { version = "0.9.0", default-features = true }
+parley = { version = "0.11.0", default-features = true }

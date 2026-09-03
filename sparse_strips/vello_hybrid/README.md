@@ -19,6 +19,9 @@ Full documentation at https://github.com/orium/cargo-rdme -->
 <!-- Intra-doc links used in lib.rs should be evaluated here.
 See https://linebender.org/blog/doc-include/ for related discussion. -->
 
+[`Resources`]: https://docs.rs/vello_hybrid/latest/vello_hybrid/struct.Resources.html
+[`Scene::glyph_run`]: https://docs.rs/vello_hybrid/latest/vello_hybrid/struct.Scene.html#method.glyph_run
+
 <!-- cargo-rdme start -->
 
 A hybrid CPU/GPU renderer for 2D vector graphics.
@@ -54,15 +57,40 @@ The renderer is split into several key components:
 
 - `Scene`: Manages the render context and path processing on the CPU
 - `Renderer` or `WebGlRenderer`: Handles GPU resource management and executes draw operations
-- `Scheduler`: Manages and schedules draw operations on the renderer.
 
 See the individual module documentation for more details on usage and implementation.
+
+## Current state
+
+Vello Hybrid is a solid GPU-accelerated 2D renderer with broad, reliable
+feature support. Although it does not match Vello Classic's raw performance
+on dynamic and vector-heavy workloads, it provides excellent performance
+on workloads that benefit from GPU acceleration, such as images,
+gradients, and filters. Overall, we still consider it to be slightly less
+mature than its CPU-only counterpart Vello CPU.
+
+Vello Hybrid remains under active development. Known limitations include:
+
+- The following features are not yet supported and will panic: Mask layers,
+  complex filter graphs as well as certain blend modes for non-isolated
+  blending.
+- Parts of the API and its documentation are still suboptimal, for example
+  the lifecycle and ownership of external resources through [`Resources`][].
+- Some exposed features remain experimental and are not recommended for use,
+  including glyph caching. Experimental APIs are identified in their method
+  documentation.
+- Parts of the rendering pipeline are not yet fully optimized, particularly
+  the wgpu backend, but also other aspects.
+- Some failures panic instead of being reported through a user-facing error.
+
+With that said, we are continuously improving Vello Hybrid and will address
+these and other limitations in future releases.
 
 <!-- cargo-rdme end -->
 
 ## Minimum supported Rust Version (MSRV)
 
-This version of Vello Hybrid has been verified to compile with **Rust 1.88** and later.
+This version of Vello Hybrid has been verified to compile with **Rust 1.89** and later.
 
 Future versions of Vello Hybrid might increase the Rust version requirement.
 It will not be treated as a breaking change and as such can even happen with small patch releases.

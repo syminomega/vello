@@ -24,7 +24,7 @@ where
 
         g.bench_with_input(BenchmarkId::from_parameter(&item.name), &item, |b, item| {
             b.iter(|| {
-                let mut tiler = Tiles::new(Level::new(), item.height);
+                let mut tiler = Tiles::new(Level::new(), item.width, item.height);
                 op(&mut tiler, &lines, item.width, item.height);
             });
         });
@@ -37,11 +37,13 @@ pub fn tile(c: &mut Criterion) {
         tiler.make_tiles_analytic_aa(Level::new(), lines, w, h);
     });
 
-    run_tile_benchmark::<false, _>(c, "tile_msaa", |tiler, lines, w, h| {
-        tiler.make_tiles_msaa(lines, w, h);
-    });
+    if crate::EXTENDED {
+        run_tile_benchmark::<false, _>(c, "tile_msaa", |tiler, lines, w, h| {
+            tiler.make_tiles_msaa(lines, w, h);
+        });
 
-    run_tile_benchmark::<true, _>(c, "tile_aaa_shift50", |tiler, lines, w, h| {
-        tiler.make_tiles_analytic_aa(Level::new(), lines, w, h);
-    });
+        run_tile_benchmark::<true, _>(c, "tile_aaa_shift50", |tiler, lines, w, h| {
+            tiler.make_tiles_analytic_aa(Level::new(), lines, w, h);
+        });
+    }
 }

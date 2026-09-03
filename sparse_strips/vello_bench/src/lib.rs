@@ -8,16 +8,17 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 
 pub mod allocator;
-pub mod coarse;
 pub mod data;
 pub mod fine;
 pub mod flatten;
 pub mod glyph;
 pub mod integration;
+pub mod pixmap;
 pub mod sort;
 pub mod strip;
 pub mod tile;
 
 pub(crate) const SEED: [u8; 32] = [0; 32];
+pub(crate) const EXTENDED: bool = cfg!(feature = "extended");
 pub static DATA_PATH: LazyLock<PathBuf> =
     LazyLock::new(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data"));

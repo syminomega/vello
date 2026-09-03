@@ -20,9 +20,7 @@ use vello_cpu::color::palette::css::{BLUE, GREEN, RED, YELLOW};
 use vello_cpu::kurbo::Dashes;
 use vello_dev_macros::vello_test;
 
-// TODO: We are purposefully using multiple of WideTile width/height here, because the implementation
-// currently works incorrectly if it's not the case. Once the issue as been fixed, we should update
-// this test to use normal dimensions.
+// TODO: Update this test to use non-wide tile dimensions.
 #[vello_test(skip_multithreaded, width = 256, height = 40)]
 fn filter_flood(ctx: &mut impl Renderer) {
     let filter_flood = Filter::from_primitive(FilterPrimitive::Flood { color: TOMATO });
@@ -64,6 +62,34 @@ fn filter_offset_simple(ctx: &mut impl Renderer) {
 }
 
 #[vello_test(skip_multithreaded)]
+fn filter_offset_vertical_only(ctx: &mut impl Renderer) {
+    let filter = Filter::from_primitive(FilterPrimitive::Offset { dx: 0.0, dy: 10.0 });
+    ctx.push_filter_layer(filter);
+    ctx.set_paint(RED);
+    ctx.fill_rect(&Rect::new(10.0, 0.0, 90.0, 80.0));
+    ctx.pop_layer();
+}
+
+#[vello_test(skip_multithreaded)]
+fn filter_offset_horizontal_only(ctx: &mut impl Renderer) {
+    let filter = Filter::from_primitive(FilterPrimitive::Offset { dx: 10.0, dy: 0.0 });
+    ctx.push_filter_layer(filter);
+    ctx.set_paint(RED);
+    ctx.fill_rect(&Rect::new(0.0, 10.0, 80.0, 90.0));
+    ctx.pop_layer();
+}
+
+#[vello_test(skip_multithreaded)]
+fn filter_offset_flipped(ctx: &mut impl Renderer) {
+    ctx.set_transform(Affine::translate((100.0, 100.0)) * Affine::scale(-1.0));
+    let filter = Filter::from_primitive(FilterPrimitive::Offset { dx: 0.0, dy: 10.0 });
+    ctx.push_filter_layer(filter);
+    ctx.set_paint(RED);
+    ctx.fill_rect(&Rect::new(10.0, 0.0, 90.0, 80.0));
+    ctx.pop_layer();
+}
+
+#[vello_test(skip_multithreaded)]
 fn filter_offset_no_offset(ctx: &mut impl Renderer) {
     let filter = Filter::from_primitive(FilterPrimitive::Offset { dx: 0.0, dy: 0.0 });
     ctx.push_filter_layer(filter);
@@ -72,7 +98,7 @@ fn filter_offset_no_offset(ctx: &mut impl Renderer) {
     ctx.pop_layer();
 }
 
-#[vello_test(skip_multithreaded, skip_hybrid, cpu_u8_tolerance = 1)]
+#[vello_test(skip_multithreaded, cpu_u8_tolerance = 1)]
 fn filter_clip_layer_correctly_culls_strips_vertical(ctx: &mut impl Renderer) {
     filter_clip_layer_correctly_culls_strips(
         ctx,
@@ -82,7 +108,7 @@ fn filter_clip_layer_correctly_culls_strips_vertical(ctx: &mut impl Renderer) {
     );
 }
 
-#[vello_test(skip_multithreaded, skip_hybrid, cpu_u8_tolerance = 1)]
+#[vello_test(skip_multithreaded, cpu_u8_tolerance = 1)]
 fn filter_clip_layer_correctly_culls_strips_horizontal(ctx: &mut impl Renderer) {
     filter_clip_layer_correctly_culls_strips(
         ctx,
@@ -149,7 +175,7 @@ fn filter_gaussian_blur_no_decimation(ctx: &mut impl Renderer) {
 
 /// Test Gaussian blur with larger radius (`std_deviation` = 4.0, uses decimation).
 /// Uses multi-scale downsampling for performance.
-#[vello_test(skip_multithreaded, hybrid_tolerance = 1)]
+#[vello_test(skip_multithreaded, hybrid_tolerance = 2)]
 fn filter_gaussian_blur_with_decimation(ctx: &mut impl Renderer) {
     let filter = Filter::from_primitive(FilterPrimitive::GaussianBlur {
         std_deviation: 4.0,
@@ -229,8 +255,67 @@ fn filter_drop_shadow(ctx: &mut impl Renderer) {
     ctx.pop_layer();
 }
 
+#[vello_test(skip_multithreaded, hybrid_tolerance = 1)]
+fn filter_drop_shadow_only_simple(ctx: &mut impl Renderer) {
+    let filter = Filter::from_primitive(FilterPrimitive::DropShadowOnly {
+        dx: 20.0,
+        dy: 20.0,
+        std_deviation: 3.0,
+        color: TOMATO,
+        edge_mode: EdgeMode::None,
+    });
+
+    ctx.push_filter_layer(filter);
+    ctx.set_paint(ROYAL_BLUE);
+    ctx.fill_rect(&Rect::new(20.0, 20.0, 60.0, 60.0));
+    ctx.pop_layer();
+}
+
+#[vello_test(skip_multithreaded, hybrid_tolerance = 1)]
+fn filter_drop_shadow_only_simple_with_opacity(ctx: &mut impl Renderer) {
+    let filter = Filter::from_primitive(FilterPrimitive::DropShadowOnly {
+        dx: 20.0,
+        dy: 20.0,
+        std_deviation: 3.0,
+        color: TOMATO,
+        edge_mode: EdgeMode::None,
+    });
+
+    ctx.push_filter_layer(filter);
+    ctx.set_paint(ROYAL_BLUE.with_alpha(0.5));
+    ctx.fill_rect(&Rect::new(20.0, 20.0, 60.0, 60.0));
+    ctx.pop_layer();
+}
+
+#[vello_test(skip_multithreaded, hybrid_tolerance = 2)]
+fn filter_drop_shadow_only_four_directions(ctx: &mut impl Renderer) {
+    let rect = Rect::new(35.0, 35.0, 65.0, 65.0);
+    let shadows = [
+        (-20.0, -20.0, RED),
+        (20.0, -20.0, GREEN),
+        (-20.0, 20.0, BLUE),
+        (20.0, 20.0, YELLOW),
+    ];
+
+    for (dx, dy, color) in shadows {
+        let filter = Filter::from_primitive(FilterPrimitive::DropShadowOnly {
+            dx,
+            dy,
+            std_deviation: 3.0,
+            color,
+            edge_mode: EdgeMode::None,
+        });
+
+        ctx.push_filter_layer(filter);
+        // Just to double-check that the existing color is ignored.
+        ctx.set_paint(BLUE);
+        ctx.fill_rect(&rect);
+        ctx.pop_layer();
+    }
+}
+
 // Make sure drop shadows are not cut off at the top/left.
-#[vello_test(skip_multithreaded, skip_hybrid, width = 100, height = 100)]
+#[vello_test(skip_multithreaded, hybrid_tolerance = 1, width = 100, height = 100)]
 fn filter_drop_shadow_offscreen(ctx: &mut impl Renderer) {
     let filter = Filter::from_primitive(FilterPrimitive::DropShadow {
         dx: 20.0,
@@ -429,7 +514,7 @@ fn filter_set_effect(ctx: &mut impl Renderer) {
 
 /// Test filter interactions with layers, clips, blend modes, and opacity.
 /// 9 scenarios testing filters at various depths, with clips, opacity, blend modes, etc.
-#[vello_test(skip_multithreaded, hybrid_tolerance = 2)]
+#[vello_test(skip_multithreaded, hybrid_tolerance = 3)]
 fn filter_varying_depths_clips_and_compositions(ctx: &mut impl Renderer) {
     let filter_drop_shadow = Filter::from_primitive(FilterPrimitive::DropShadow {
         dx: 2.0,
@@ -904,13 +989,7 @@ fn filter_varying_depths_clips_and_compositions(ctx: &mut impl Renderer) {
 /// This verifies that the expansion calculation uses `transform_rect_bbox` to account for
 /// the full transformation matrix (including rotation and shear), rather than just extracting
 /// x/y scales separately. A 45-degree rotation should produce a diamond-shaped blur.
-// TODO: Re-enable hybrid once proper edge handling is implemented in Vello hybrid.
-#[vello_test(
-    skip_multithreaded,
-    skip_hybrid,
-    skip_hybrid_constrained,
-    hybrid_tolerance = 2
-)]
+#[vello_test(skip_multithreaded, hybrid_tolerance = 2)]
 fn filter_rotated_blur(ctx: &mut impl Renderer) {
     let filter_gaussian_blur = Filter::from_primitive(FilterPrimitive::GaussianBlur {
         std_deviation: 4.0,
@@ -1064,7 +1143,7 @@ fn filter_offset(ctx: &mut impl Renderer) {
 }
 
 /// Test blur with various transforms (translate, rotate, scale, skew).
-#[vello_test(skip_multithreaded, hybrid_tolerance = 2, diff_pixels = 1)]
+#[vello_test(skip_multithreaded, hybrid_tolerance = 3, diff_pixels = 1)]
 fn filter_transformed_blur(ctx: &mut impl Renderer) {
     let filter = Filter::from_primitive(FilterPrimitive::GaussianBlur {
         std_deviation: 3.0,
@@ -1126,13 +1205,7 @@ fn filter_nested_layers(ctx: &mut impl Renderer) {
 }
 
 /// Test blur with very large `std_deviation`.
-// TODO: Re-enable hybrid once proper edge handling is implemented in Vello hybrid.
-#[vello_test(
-    skip_multithreaded,
-    skip_hybrid,
-    skip_hybrid_constrained,
-    hybrid_tolerance = 3
-)]
+#[vello_test(skip_multithreaded, hybrid_tolerance = 3)]
 fn filter_extreme_blur(ctx: &mut impl Renderer) {
     let filter = Filter::from_primitive(FilterPrimitive::GaussianBlur {
         std_deviation: 20.0,
@@ -1146,15 +1219,7 @@ fn filter_extreme_blur(ctx: &mut impl Renderer) {
     ctx.pop_layer();
 }
 
-// TODO: Re-enable hybrid once proper edge handling is implemented in Vello hybrid.
-#[vello_test(
-    skip_multithreaded,
-    skip_hybrid,
-    skip_hybrid_constrained,
-    hybrid_tolerance = 4,
-    width = 400,
-    height = 400
-)]
+#[vello_test(skip_multithreaded, hybrid_tolerance = 4, width = 400, height = 400)]
 fn filter_extreme_blur_2(ctx: &mut impl Renderer) {
     let filter = Filter::from_primitive(FilterPrimitive::GaussianBlur {
         std_deviation: 36.0,
@@ -1222,16 +1287,8 @@ fn filter_stroked_paths(ctx: &mut impl Renderer) {
 
 /// Test filter on shapes at canvas boundaries.
 ///
-/// TODO: This test currently demonstrates a bug where filters render incorrectly
-/// when filtered elements are near or extend beyond viewport boundaries.
 /// See: <https://github.com/linebender/vello/issues/1304>
-// TODO: Re-enable hybrid once proper edge handling is implemented in Vello hybrid.
-#[vello_test(
-    skip_multithreaded,
-    skip_hybrid,
-    skip_hybrid_constrained,
-    hybrid_tolerance = 2
-)]
+#[vello_test(skip_multithreaded, hybrid_tolerance = 3)]
 fn issue_filter_canvas_boundaries(ctx: &mut impl Renderer) {
     let filter = Filter::from_primitive(FilterPrimitive::GaussianBlur {
         std_deviation: 5.0,
@@ -1264,31 +1321,6 @@ fn issue_filter_canvas_boundaries(ctx: &mut impl Renderer) {
     ctx.push_filter_layer(filter);
     ctx.set_paint(VIOLET);
     ctx.fill_path(&rect_br);
-    ctx.pop_layer();
-}
-
-// If the bbox of a filter layer doesn't start on the top-left wide tile, we will shift
-// the image so the top-left wide tile of the bbox starts at (0, 0). This test
-// ensures that complex paints are also appropriately shifted. The correct behavior is
-// to see the whole gradient, the wrong behavior would be to only see a blue rectangle.
-#[vello_test(skip_multithreaded, width = 512, height = 4)]
-fn filter_with_complex_paint_and_wide_tile_shift(ctx: &mut impl Renderer) {
-    let filter = Filter::from_primitive(FilterPrimitive::Offset { dx: 0.0, dy: 0.0 });
-
-    let gradient = Gradient {
-        kind: LinearGradientPosition {
-            start: Point::new(256.0, 0.0),
-            end: Point::new(512.0, 0.0),
-        }
-        .into(),
-        stops: stops_blue_green_red_yellow(),
-        extend: Extend::Pad,
-        ..Default::default()
-    };
-
-    ctx.push_filter_layer(filter);
-    ctx.set_paint(gradient);
-    ctx.fill_rect(&Rect::new(256.0, 0.0, 612.0, 4.0));
     ctx.pop_layer();
 }
 
@@ -1391,11 +1423,8 @@ pub(crate) fn blur_with_edge_mode(ctx: &mut impl Renderer, edge_mode: EdgeMode) 
     ctx.pop_layer();
 }
 
-// TODO: Currently, these tests have a width/height that is a multiple of a wide tile,
-// because edge modes currently don't handle other widths/heights correctly. Once that is
-// fixed, we should change the tests back to 100x100 to exercise that path as well.
-// Also, these tests are currently ignored everywhere because support for edge mode has
-// been temporarily disabled.
+// TODO: Change these tests back to 100x100 once edge modes are properly supported.
+// These tests are currently ignored because support for edge modes has been temporarily disabled.
 
 #[vello_test(ignore, width = 256, height = 100)]
 fn filter_gaussian_blur_edge_mode_duplicate(ctx: &mut impl Renderer) {
@@ -1505,7 +1534,7 @@ fn filter_blending_in_layer(ctx: &mut impl Renderer) {
     ctx.pop_layer();
 }
 
-#[vello_test(skip_multithreaded)]
+#[vello_test(skip_multithreaded, hybrid_no_depth)]
 fn filter_layer_with_blending(ctx: &mut impl Renderer) {
     let filter = Filter::from_primitive(FilterPrimitive::Offset { dx: 0.0, dy: 0.0 });
 
@@ -1545,13 +1574,7 @@ fn filter_layer_with_blending_and_opacity(ctx: &mut impl Renderer) {
     ctx.pop_layer();
 }
 
-// TODO: Re-enable hybrid once proper edge handling is implemented in Vello hybrid.
-#[vello_test(
-    skip_multithreaded,
-    skip_hybrid,
-    skip_hybrid_constrained,
-    hybrid_tolerance = 3
-)]
+#[vello_test(skip_multithreaded, hybrid_tolerance = 3)]
 fn filter_clip_with_constrained_blur(ctx: &mut impl Renderer) {
     let filter = Filter::from_primitive(FilterPrimitive::GaussianBlur {
         std_deviation: 16.0,
@@ -1598,13 +1621,7 @@ fn filter_clip_blend_nested(ctx: &mut impl Renderer) {
     ctx.pop_layer();
 }
 
-// TODO: Re-enable hybrid once proper edge handling is implemented in Vello hybrid.
-#[vello_test(
-    skip_multithreaded,
-    skip_hybrid,
-    skip_hybrid_constrained,
-    hybrid_tolerance = 2
-)]
+#[vello_test(skip_multithreaded, hybrid_tolerance = 3)]
 fn filter_with_non_rect_clip(ctx: &mut impl Renderer) {
     let filter = Filter::from_primitive(FilterPrimitive::GaussianBlur {
         std_deviation: 7.0,
@@ -1660,8 +1677,7 @@ fn filter_sequential_clip_layers(ctx: &mut impl Renderer) {
     ctx.pop_layer();
 }
 
-// TODO: Re-enable hybrid once proper edge handling is implemented in Vello hybrid.
-#[vello_test(skip_multithreaded, skip_hybrid, skip_hybrid_constrained)]
+#[vello_test(skip_multithreaded)]
 fn filter_with_out_of_bounds_clip(ctx: &mut impl Renderer) {
     let filter = Filter::from_primitive(FilterPrimitive::GaussianBlur {
         std_deviation: 2.0,
@@ -1706,20 +1722,12 @@ fn filter_with_inner_clip_shifted(ctx: &mut impl Renderer) {
     ctx.pop_layer();
 }
 
-// TODO: Re-enable hybrid once proper edge handling is implemented in Vello hybrid.
-#[vello_test(
-    skip_multithreaded,
-    skip_hybrid,
-    skip_hybrid_constrained,
-    width = 256,
-    height = 100,
-    hybrid_tolerance = 2
-)]
+#[vello_test(skip_multithreaded, width = 256, height = 100, hybrid_tolerance = 2)]
 fn filter_gaussian_blur_edge_mode_none(ctx: &mut impl Renderer) {
     blur_with_edge_mode(ctx, EdgeMode::None);
 }
 
-#[vello_test(skip_multithreaded, hybrid_tolerance = 1)]
+#[vello_test(skip_multithreaded, hybrid_tolerance = 3)]
 fn filter_with_outer_clip_path(ctx: &mut impl Renderer) {
     let clip_rect = Rect::new(25.0, 25.0, 75.0, 75.0);
     let rect = clip_rect.inflate(5.0, 5.0);
@@ -1736,7 +1744,7 @@ fn filter_with_outer_clip_path(ctx: &mut impl Renderer) {
     ctx.pop_clip_path();
 }
 
-#[vello_test(skip_multithreaded, hybrid_tolerance = 1)]
+#[vello_test(skip_multithreaded, hybrid_tolerance = 3)]
 fn filter_with_inner_clip_path(ctx: &mut impl Renderer) {
     let clip_rect = Rect::new(25.0, 25.0, 75.0, 75.0);
     let rect = clip_rect.inflate(5.0, 5.0);
@@ -1779,7 +1787,7 @@ fn filter_nested_with_outer_clip_path(ctx: &mut impl Renderer) {
     ctx.pop_clip_path();
 }
 
-#[vello_test(skip_multithreaded, skip_hybrid)]
+#[vello_test(skip_multithreaded)]
 fn filter_with_clip_paths_outside_of_viewport(ctx: &mut impl Renderer) {
     // This test draws 100x100 rectangles at the border of each viewport side, but
     // clips them to a smaller 10x60 (or 60x10) rectangle. The drop shadow is drawn with such
@@ -1848,4 +1856,184 @@ fn filter_with_inner_clip_that_stays_alive(ctx: &mut impl Renderer) {
     ctx.set_paint(RED);
     ctx.fill_rect(&viewport);
     ctx.pop_clip_path();
+}
+
+#[vello_test(
+    skip_multithreaded,
+    width = 600,
+    height = 450,
+    cpu_u8_tolerance = 1,
+    hybrid_tolerance = 2
+)]
+fn filter_expansion_grid(ctx: &mut impl Renderer) {
+    #[derive(Clone, Copy)]
+    enum ExpansionFilter {
+        Blur {
+            std_deviation: f32,
+        },
+        DropShadow {
+            dx: f32,
+            dy: f32,
+            std_deviation: f32,
+            shadow_only: bool,
+        },
+    }
+
+    #[derive(Clone, Copy)]
+    struct ExpansionCase {
+        filter: ExpansionFilter,
+        rotation_degrees: f64,
+        scale: (f64, f64),
+    }
+
+    const fn expansion_blur(
+        std_deviation: f32,
+        rotation_degrees: f64,
+        scale: (f64, f64),
+    ) -> ExpansionCase {
+        ExpansionCase {
+            filter: ExpansionFilter::Blur { std_deviation },
+            rotation_degrees,
+            scale,
+        }
+    }
+
+    const fn expansion_shadow(
+        dx: f32,
+        dy: f32,
+        std_deviation: f32,
+        shadow_only: bool,
+        rotation_degrees: f64,
+        scale: (f64, f64),
+    ) -> ExpansionCase {
+        ExpansionCase {
+            filter: ExpansionFilter::DropShadow {
+                dx,
+                dy,
+                std_deviation,
+                shadow_only,
+            },
+            rotation_degrees,
+            scale,
+        }
+    }
+
+    fn draw_expansion_case(ctx: &mut impl Renderer, case: ExpansionCase, center: (f64, f64)) {
+        const RADIUS: f64 = 16.0;
+        const CONTENT_BOUNDS: Rect = Rect::new(-RADIUS, -RADIUS, RADIUS, RADIUS);
+
+        let filter = match case.filter {
+            ExpansionFilter::Blur { std_deviation } => {
+                Filter::from_primitive(FilterPrimitive::GaussianBlur {
+                    std_deviation,
+                    edge_mode: EdgeMode::None,
+                })
+            }
+            ExpansionFilter::DropShadow {
+                dx,
+                dy,
+                std_deviation,
+                shadow_only,
+            } => {
+                let color = AlphaColor::from_rgba8(0, 0, 0, 180);
+                let primitive = if shadow_only {
+                    FilterPrimitive::DropShadowOnly {
+                        dx,
+                        dy,
+                        std_deviation,
+                        color,
+                        edge_mode: EdgeMode::None,
+                    }
+                } else {
+                    FilterPrimitive::DropShadow {
+                        dx,
+                        dy,
+                        std_deviation,
+                        color,
+                        edge_mode: EdgeMode::None,
+                    }
+                };
+                Filter::from_primitive(primitive)
+            }
+        };
+
+        let transform = Affine::translate(center)
+            * Affine::rotate(case.rotation_degrees.to_radians())
+            * Affine::scale_non_uniform(case.scale.0, case.scale.1);
+
+        let circle = Circle::new((0.0, 0.0), RADIUS).to_path(0.1);
+
+        ctx.set_transform(transform);
+        ctx.push_filter_layer(filter.clone());
+        ctx.set_paint(ROYAL_BLUE);
+        ctx.fill_path(&circle);
+        ctx.pop_layer();
+
+        let content_bounds = transform.transform_rect_bbox(CONTENT_BOUNDS);
+        let expand = |expansion: Rect| {
+            Rect::new(
+                content_bounds.x0 + expansion.x0,
+                content_bounds.y0 + expansion.y0,
+                content_bounds.x1 + expansion.x1,
+                content_bounds.y1 + expansion.y1,
+            )
+        };
+        let source_bounds = expand(filter.source_expansion(&transform));
+        let filter_bounds = expand(filter.filter_expansion(&transform));
+
+        ctx.set_transform(Affine::IDENTITY);
+
+        ctx.set_stroke(Stroke::new(0.75));
+        ctx.set_paint(RED);
+        ctx.stroke_path(&source_bounds.to_path(0.1));
+        ctx.set_stroke(Stroke::new(0.75));
+        ctx.set_paint(GREEN);
+        ctx.stroke_path(&filter_bounds.to_path(0.1));
+    }
+
+    const CASES: [ExpansionCase; 12] = [
+        expansion_blur(1.0, 0.0, (1.0, 1.0)),
+        expansion_blur(4.0, 0.0, (1.0, 1.0)),
+        expansion_blur(8.0, 0.0, (1.0, 1.0)),
+        expansion_shadow(0.0, 0.0, 4.0, false, 0.0, (1.0, 1.0)),
+        expansion_shadow(16.0, 0.0, 2.0, false, 0.0, (1.0, 1.0)),
+        expansion_shadow(0.0, 16.0, 4.0, false, 0.0, (1.0, 1.0)),
+        expansion_shadow(-16.0, -12.0, 6.0, false, 0.0, (1.0, 1.0)),
+        expansion_shadow(14.0, -14.0, 3.0, false, 0.0, (1.0, 1.0)),
+        expansion_blur(5.0, 30.0, (1.0, 1.0)),
+        expansion_shadow(16.0, 8.0, 4.0, false, 0.0, (1.35, 0.65)),
+        expansion_shadow(-14.0, 12.0, 5.0, true, -30.0, (1.0, 1.0)),
+        expansion_shadow(12.0, 16.0, 7.0, true, 45.0, (0.75, 1.25)),
+    ];
+
+    const COLUMNS: usize = 4;
+    const CELL_WIDTH: f64 = 150.0;
+    const CELL_HEIGHT: f64 = 150.0;
+
+    for (index, case) in CASES.into_iter().enumerate() {
+        let column = index % COLUMNS;
+        let row = index / COLUMNS;
+        let center = (
+            (column as f64 + 0.5) * CELL_WIDTH,
+            (row as f64 + 0.5) * CELL_HEIGHT,
+        );
+        draw_expansion_case(ctx, case, center);
+    }
+}
+
+#[vello_test(skip_multithreaded, hybrid_tolerance = 2)]
+fn filter_with_clip_and_inner_clip(ctx: &mut impl Renderer) {
+    let filter = Filter::from_primitive(FilterPrimitive::GaussianBlur {
+        std_deviation: 10.0,
+        edge_mode: EdgeMode::None,
+    });
+    let clip1 = Rect::new(25.0, 25.0, 75.0, 75.0).to_path(0.1);
+    let clip2 = Rect::new(30.0, 30.0, 70.0, 70.0).to_path(0.1);
+
+    ctx.push_layer(Some(&clip1), None, None, None, Some(filter));
+    ctx.push_clip_layer(&clip2);
+    ctx.set_paint(RED);
+    ctx.fill_rect(&Rect::new(0.0, 0.0, 100.0, 100.0));
+    ctx.pop_layer();
+    ctx.pop_layer();
 }

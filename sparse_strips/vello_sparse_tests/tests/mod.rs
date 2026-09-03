@@ -34,12 +34,15 @@ mod basic;
 mod blurred_rounded_rect;
 mod clip;
 mod compose;
-mod default_blending_only_fast_path;
 mod external_texture;
 mod filter;
 mod glyph;
 mod gradient;
+mod hybrid_depth;
+mod hybrid_schedule;
 mod image;
+#[cfg(all(target_arch = "wasm32", feature = "webgl"))]
+mod image_atlas;
 mod issues;
 mod layer;
 mod mask;
@@ -51,3 +54,4 @@ mod scenes;
 mod util;
 #[cfg(target_arch = "wasm32")]
 mod wasm_binary_invariants;
+mod wide_tile;

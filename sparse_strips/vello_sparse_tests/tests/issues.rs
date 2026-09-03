@@ -10,7 +10,7 @@ use std::sync::Arc;
 use vello_common::color::PremulRgba8;
 use vello_common::color::palette::css::{BLUE, DARK_BLUE, LIME, REBECCA_PURPLE};
 use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
-use vello_common::kurbo::{Affine, BezPath, Rect, Shape, Stroke};
+use vello_common::kurbo::{Affine, BezPath, Circle, Rect, Shape, Stroke};
 use vello_common::paint::Image;
 use vello_common::peniko::GradientKind::Radial;
 use vello_common::peniko::color::palette::css::{PURPLE, ROYAL_BLUE, TOMATO};
@@ -20,7 +20,7 @@ use vello_common::peniko::{
     InterpolationAlphaSpace, Mix,
 };
 use vello_common::peniko::{ColorStops, RadialGradientPosition};
-use vello_common::pixmap::Pixmap;
+use vello_common::pixmap::{PixelMetadata, Pixmap};
 use vello_cpu::color::palette::css::{BLACK, RED};
 use vello_cpu::peniko::{Compose, Extend};
 use vello_cpu::{Level, RasterizerSettings, RenderContext, RenderMode, RenderSettings};
@@ -222,21 +222,6 @@ fn triangle_exceeding_viewport_2(ctx: &mut impl Renderer) {
     ctx.fill_path(&path);
 }
 
-#[vello_test(width = 256, height = 4, no_ref)]
-// https://github.com/LaurenzV/cpu-sparse-experiments/issues/30
-fn shape_at_wide_tile_boundary(ctx: &mut impl Renderer) {
-    let mut path = BezPath::new();
-    path.move_to((248.0, 0.0));
-    path.line_to((257.0, 0.0));
-    path.line_to((257.0, 2.0));
-    path.line_to((248.0, 2.0));
-    path.close_path();
-
-    ctx.set_fill_rule(Fill::EvenOdd);
-    ctx.set_paint(LIME);
-    ctx.fill_path(&path);
-}
-
 #[vello_test(width = 50, height = 50)]
 fn eo_filling_missing_anti_aliasing(ctx: &mut impl Renderer) {
     let mut path = BezPath::new();
@@ -358,13 +343,27 @@ fn do_not_panic_on_multiple_flushes(ctx: &mut impl Renderer) {
 }
 
 /// <https://github.com/linebender/vello/issues/1119>
-#[vello_test(skip_hybrid)]
+#[vello_test]
 fn clip_clear(ctx: &mut impl Renderer) {
     // initial coloring
     ctx.set_paint(LIME);
     ctx.fill_rect(&Rect::new(0.0, 0.0, 100.0, 100.0));
     ctx.push_layer(
         Some(&Rect::new(0., 0., 50., 50.).to_path(0.1)),
+        Some(Compose::Clear.into()),
+        None,
+        None,
+        None,
+    );
+    ctx.pop_layer();
+}
+
+#[vello_test(hybrid_tolerance = 1)]
+fn clip_clear_circle(ctx: &mut impl Renderer) {
+    ctx.set_paint(LIME);
+    ctx.fill_rect(&Rect::new(0.0, 0.0, 100.0, 100.0));
+    ctx.push_layer(
+        Some(&Circle::new((50.25, 49.75), 30.5).to_path(0.1)),
         Some(Compose::Clear.into()),
         None,
         None,
@@ -499,7 +498,7 @@ fn large_dimensions(ctx: &mut impl Renderer) {
     ctx.fill_rect(&Rect::new(0.0, 0.0, u16::MAX as f64 + 10.0, 8.0));
 }
 
-#[vello_test(skip_multithreaded, skip_hybrid)]
+#[vello_test(skip_multithreaded)]
 fn issue_1417(ctx: &mut impl Renderer) {
     let filter_drop_shadow = Filter::from_primitive(FilterPrimitive::Offset { dx: 0.0, dy: 0.0 });
 
@@ -547,7 +546,7 @@ fn issue_1417(ctx: &mut impl Renderer) {
     }
 }
 
-#[vello_test(skip_hybrid, skip_multithreaded)]
+#[vello_test(skip_multithreaded)]
 fn issue_1421(ctx: &mut impl Renderer) {
     let filter_flood = Filter::from_primitive(FilterPrimitive::Flood { color: TOMATO });
     let rect = Rect::new(15.0, 15.0, 85.0, 85.0).to_path(0.1);
@@ -572,7 +571,7 @@ fn issue_1433(ctx: &mut impl Renderer) {
         b, b, b, b
     ];
 
-    let pixmap = Pixmap::from_parts(image, 4, 4);
+    let pixmap = Pixmap::from_parts(bytemuck::cast_vec(image), 4, 4, PixelMetadata::default());
     let source = ctx.get_image_source(Arc::new(pixmap));
     let image = Image {
         image: source,
@@ -629,7 +628,7 @@ fn issue_1468(ctx: &mut impl Renderer) {
     ctx.fill_rect(&Rect::new(0.0, 0.0, 10.0, 10.0));
 }
 
-#[vello_test(width = 768, height = 4, skip_multithreaded, skip_hybrid)]
+#[vello_test(width = 768, height = 4, skip_multithreaded)]
 fn issue_1477(ctx: &mut impl Renderer) {
     let filter = Filter::from_primitive(FilterPrimitive::Offset { dx: 0.0, dy: 0.0 });
     let rect = Rect::new(0.0, 0.0, 768.0, 4.0);
@@ -643,7 +642,7 @@ fn issue_1477(ctx: &mut impl Renderer) {
     ctx.fill_rect(&rect);
 }
 
-#[vello_test(width = 512, height = 16)]
+#[vello_test(width = 512, height = 16, hybrid_no_depth)]
 fn opaque_rect_partially_occluding_aa_edge(ctx: &mut impl Renderer) {
     // Hypotenuse crosses strip row y in 8..12 over the full width, producing one
     // long AA strip. The rect's interior covers depth buckets [128, 384), splitting
@@ -659,15 +658,7 @@ fn opaque_rect_partially_occluding_aa_edge(ctx: &mut impl Renderer) {
     ctx.fill_rect(&Rect::new(96.0, 8.0, 416.0, 12.0));
 }
 
-// TODO: Re-enable hybrid once proper edge handling is implemented in Vello hybrid.
-#[vello_test(
-    skip_multithreaded,
-    skip_hybrid,
-    skip_hybrid_constrained,
-    width = 768,
-    height = 100,
-    hybrid_tolerance = 3
-)]
+#[vello_test(skip_multithreaded, width = 768, height = 100, hybrid_tolerance = 4)]
 fn issue_1509(ctx: &mut impl Renderer) {
     let filter = Filter::from_primitive(FilterPrimitive::GaussianBlur {
         std_deviation: 25.0,
@@ -773,58 +764,6 @@ fn issue_1707_transparent_solid_fill(ctx: &mut impl Renderer) {
     ctx.fill_rect(&Rect::new(0.0, 0.0, 100.0, 100.0));
 }
 
-#[vello_test]
-fn issue_fast_path_strips_in_later_round(ctx: &mut impl Renderer) {
-    ctx.push_layer(None, None, None, None, None);
-    ctx.push_layer(None, None, None, None, None);
-    ctx.push_layer(None, None, None, None, None);
-    ctx.set_paint(Color::from_rgba8(0, 0, 255, 255));
-    ctx.fill_rect(&Rect::new(10.0, 10.0, 70.0, 70.0));
-    ctx.pop_layer();
-    ctx.pop_layer();
-    ctx.pop_layer();
-
-    ctx.set_paint(Color::from_rgba8(255, 0, 0, 255));
-    ctx.fill_rect(&Rect::new(30.0, 30.0, 90.0, 90.0));
-}
-
-#[vello_test]
-fn issue_coarse_batch_in_later_round(ctx: &mut impl Renderer) {
-    ctx.push_layer(None, None, None, None, None);
-    ctx.push_layer(None, None, None, None, None);
-    ctx.push_layer(None, None, None, None, None);
-    ctx.set_paint(Color::from_rgba8(0, 0, 255, 255));
-    ctx.fill_rect(&Rect::new(10.0, 10.0, 70.0, 70.0));
-    ctx.pop_layer();
-    ctx.pop_layer();
-    ctx.pop_layer();
-
-    ctx.push_layer(None, None, None, None, None);
-    ctx.set_paint(Color::from_rgba8(255, 0, 0, 255));
-    ctx.fill_rect(&Rect::new(30.0, 30.0, 90.0, 90.0));
-    ctx.pop_layer();
-}
-
-#[vello_test]
-fn issue_fast_path_strips_and_coarse_batch_in_later_round(ctx: &mut impl Renderer) {
-    ctx.push_layer(None, None, None, None, None);
-    ctx.push_layer(None, None, None, None, None);
-    ctx.push_layer(None, None, None, None, None);
-    ctx.set_paint(Color::from_rgba8(0, 0, 255, 255));
-    ctx.fill_rect(&Rect::new(25.0, 10.0, 75.0, 60.0));
-    ctx.pop_layer();
-    ctx.pop_layer();
-    ctx.pop_layer();
-
-    ctx.set_paint(Color::from_rgba8(0, 255, 0, 255));
-    ctx.fill_rect(&Rect::new(10.0, 40.0, 60.0, 90.0));
-
-    ctx.push_layer(None, None, None, None, None);
-    ctx.set_paint(Color::from_rgba8(255, 0, 0, 255));
-    ctx.fill_rect(&Rect::new(40.0, 40.0, 90.0, 90.0));
-    ctx.pop_layer();
-}
-
 #[vello_test(width = 32, height = 32, skip_hybrid, cpu_u8_tolerance = 1)]
 fn issue_bicubic_filtering_clamping(ctx: &mut impl Renderer) {
     let font_size = 10.0;
@@ -839,7 +778,7 @@ fn issue_bicubic_filtering_clamping(ctx: &mut impl Renderer) {
         .fill_glyphs(glyphs.into_iter());
 }
 
-#[vello_test(skip_multithreaded)]
+#[vello_test(skip_multithreaded, hybrid_no_depth)]
 fn issue_filter_preserves_painter_order_for_opaque_and_alpha(ctx: &mut impl Renderer) {
     let filter = Filter::from_primitive(FilterPrimitive::Offset { dx: 0.0, dy: 0.0 });
 

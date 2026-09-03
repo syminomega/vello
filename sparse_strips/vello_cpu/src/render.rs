@@ -14,7 +14,6 @@ use glifo::GlyphPrepCache;
 
 use crate::dispatch::single_threaded::SingleThreadedDispatcher;
 use crate::kurbo::{PathEl, Point};
-use crate::record::FilterData;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -23,6 +22,7 @@ use hashbrown::HashMap;
 use vello_common::blurred_rounded_rect::BlurredRoundedRectangle;
 use vello_common::encode::{EncodeExt, EncodedPaint};
 use vello_common::fearless_simd::Level;
+use vello_common::filter::FilterData;
 use vello_common::filter_effects::Filter;
 use vello_common::kurbo::{Affine, BezPath, Rect, Stroke};
 use vello_common::mask::Mask;
@@ -31,6 +31,7 @@ use vello_common::peniko::color::palette::css::BLACK;
 use vello_common::peniko::{BlendMode, Fill};
 use vello_common::pixmap::{Pixmap, PixmapMut};
 use vello_common::render_state::RenderState;
+use vello_common::transforms::{RootTransforms, Transforms};
 use vello_common::util::is_axis_aligned;
 
 #[cfg(feature = "text")]
@@ -56,6 +57,8 @@ pub(crate) const DEFAULT_GLYPH_ATLAS_SIZE: u16 = 4096;
 pub(crate) const ATLAS_IMAGE_ID_BASE: u32 = u32::MAX / 2;
 
 /// Persistent resources required by Vello CPU for rendering.
+///
+/// You should create one such instance per renderer.
 #[derive(Debug, Default)]
 pub struct Resources {
     pub(crate) image_registry: ImageRegistry,
@@ -85,6 +88,9 @@ impl Resources {
         self.maintain_glyph_cache();
     }
 }
+
+// TODO: Consider changing `Replace` to overwrite only the rendered region, leaving pixels outside
+// it unchanged. See https://github.com/linebender/vello/pull/1665#issuecomment-4667033939
 
 /// The composition mode that should be used when rendering into a pixmap.
 ///
@@ -155,8 +161,7 @@ pub struct RenderContext {
     pub(crate) height: u16,
     /// The current rendering state.
     pub(crate) state: RenderState,
-    /// Stack of root transforms.
-    root_transforms: Vec<Affine>,
+    root_transforms: RootTransforms,
     /// The current mask in place.
     pub(crate) mask: Option<Mask>,
     /// Temporary path buffer to avoid repeated allocations.
@@ -232,7 +237,7 @@ impl RenderContext {
             height,
             dispatcher,
             state: RenderState::default(),
-            root_transforms: vec![Affine::IDENTITY],
+            root_transforms: RootTransforms::default(),
             aliasing_threshold,
             render_settings: settings,
             mask: None,
@@ -242,56 +247,42 @@ impl RenderContext {
         }
     }
 
+    fn transforms(&self) -> &Transforms {
+        &self.state.transforms
+    }
+
+    fn transforms_mut(&mut self) -> &mut Transforms {
+        &mut self.state.transforms
+    }
+
     fn encode_current_paint(&mut self) -> Paint {
         match self.state.paint.clone() {
             PaintType::Solid(s) => s.into(),
             PaintType::Gradient(g) => {
-                let transform = self.effective_paint_transform();
+                let transform = self
+                    .root_transforms
+                    .effective_paint_transform(self.transforms());
                 // TODO: Add caching?
                 g.encode_into(&mut self.encoded_paints, transform, None)
             }
             PaintType::Image(i) => {
-                let transform = self.effective_paint_transform();
+                let transform = self
+                    .root_transforms
+                    .effective_paint_transform(self.transforms());
                 i.encode_into(&mut self.encoded_paints, transform, self.state.tint)
             }
         }
     }
 
-    fn root_transform(&self) -> Affine {
-        *self
-            .root_transforms
-            .last()
-            .expect("root transform stack should never be empty")
-    }
-
-    fn effective_path_transform(&self) -> Affine {
-        self.root_transform() * self.state.transform
-    }
-
-    // Unlike `effective_path_transform`, we are not applying the root transform here
-    // because clipping handles this separately. See the `clip` module for more information.
-    fn clip_path_transform(&self) -> Affine {
-        self.state.transform
-    }
-
-    fn effective_paint_transform(&self) -> Affine {
-        self.effective_path_transform() * self.state.paint_transform
-    }
-
-    pub(crate) fn push_root_transform(&mut self, relative_transform: Affine) {
-        self.root_transforms
-            .push(relative_transform * self.root_transform());
-    }
-
-    pub(crate) fn pop_root_transform(&mut self) {
-        self.root_transforms.pop();
-    }
-
     /// Fill a path.
     pub fn fill_path(&mut self, path: &BezPath) {
+        // TODO: Similarly to Vello Hybrid, make sure that inline blend + filter are applies
+        // to the same layer.
         self.with_optional_filter(|ctx| {
             let paint = ctx.encode_current_paint();
-            let transform = ctx.effective_path_transform();
+            let transform = ctx
+                .root_transforms
+                .effective_path_transform(ctx.transforms());
             ctx.dispatcher.fill_path(
                 path,
                 ctx.state.fill_rule,
@@ -308,7 +299,9 @@ impl RenderContext {
     pub fn stroke_path(&mut self, path: &BezPath) {
         self.with_optional_filter(|ctx| {
             let paint = ctx.encode_current_paint();
-            let transform = ctx.effective_path_transform();
+            let transform = ctx
+                .root_transforms
+                .effective_path_transform(ctx.transforms());
             ctx.dispatcher.stroke_path(
                 path,
                 &ctx.state.stroke,
@@ -325,7 +318,9 @@ impl RenderContext {
     pub fn fill_rect(&mut self, rect: &Rect) {
         self.with_optional_filter(|ctx| {
             let paint = ctx.encode_current_paint();
-            let transform = ctx.effective_path_transform();
+            let transform = ctx
+                .root_transforms
+                .effective_path_transform(ctx.transforms());
 
             // Fast path: Use optimized rect filling if we have no skew in the path transform
             // and anti-aliasing is enabled.
@@ -360,7 +355,9 @@ impl RenderContext {
         self.with_optional_filter(|ctx| {
             ctx.rect_to_temp_path(rect);
             let paint = ctx.encode_current_paint();
-            let transform = ctx.effective_path_transform();
+            let transform = ctx
+                .root_transforms
+                .effective_path_transform(ctx.transforms());
             ctx.dispatcher.stroke_path(
                 &ctx.temp_path,
                 &ctx.state.stroke,
@@ -422,8 +419,12 @@ impl RenderContext {
         // For performance reason we cut off the filter at some extent where the response is close to zero.
         let kernel_size = 2.5 * std_dev;
         let inflated_rect = rect.inflate(f64::from(kernel_size), f64::from(kernel_size));
-        let transform = self.effective_path_transform();
-        let paint_transform = self.effective_paint_transform();
+        let transform = self
+            .root_transforms
+            .effective_path_transform(self.transforms());
+        let paint_transform = self
+            .root_transforms
+            .effective_paint_transform(self.transforms());
 
         self.rect_to_temp_path(&inflated_rect);
 
@@ -448,8 +449,8 @@ impl RenderContext {
     ) -> GlyphRunBuilder<'a> {
         glifo::GlyphRunBuilder::new(
             font.clone(),
-            self.state.transform,
-            self.state.paint_transform,
+            self.transforms().scene_transform(),
+            *self.transforms().paint_transform(),
             crate::text::CpuGlyphRunBackend {
                 ctx: self,
                 resources,
@@ -463,6 +464,10 @@ impl RenderContext {
     /// Note that the mask, if provided, needs to have the same size as the render context. Otherwise,
     /// it will be ignored. In addition to that, the mask will not be affected by the current
     /// transformation matrix in place.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `filter` is provided when this context uses multi-threaded rendering.
     pub fn push_layer(
         &mut self,
         clip_path: Option<&BezPath>,
@@ -480,9 +485,11 @@ impl RenderContext {
         });
 
         let blend_mode = blend_mode.unwrap_or_default();
-        let opacity = opacity.unwrap_or(1.0);
-        let layer_transform = self.effective_path_transform();
-        let filter_plan = filter.map(|filter| FilterData::new(filter, layer_transform));
+        let opacity = opacity.unwrap_or(1.0).clamp(0.0, 1.0);
+        let layer_transform = self
+            .root_transforms
+            .effective_path_transform(self.transforms());
+        let filter_data = filter.map(|filter| FilterData::new(filter, layer_transform));
 
         // The important part! Let's say we have an element placed in a way such that
         // its drop shadow starts at (0, 0). In order for it to render correctly, we would
@@ -490,15 +497,11 @@ impl RenderContext {
         // not supported. Therefore, we instead shift everything down such that we can assume
         // everything left/above (0, 0) is not needed for correct rendering, and simply
         // shift everything back when actually compositing the rendered filter layer.
-        self.push_root_transform(
-            filter_plan
-                .as_ref()
-                .map_or(Affine::IDENTITY, |filter_plan| {
-                    let (shift_x, shift_y) = filter_plan.source_shift();
-
-                    Affine::translate((f64::from(shift_x), f64::from(shift_y)))
-                }),
-        );
+        let relative_transform = filter_data.as_ref().map_or(Affine::IDENTITY, |data| {
+            let (shift_x, shift_y) = data.source_shift();
+            Affine::translate((f64::from(shift_x), f64::from(shift_y)))
+        });
+        self.root_transforms.push_root(relative_transform);
 
         self.dispatcher.push_layer(
             clip_path,
@@ -508,7 +511,7 @@ impl RenderContext {
             opacity,
             self.aliasing_threshold,
             mask,
-            filter_plan,
+            filter_data,
         );
     }
 
@@ -545,6 +548,10 @@ impl RenderContext {
     /// WARNING: Note that filters are currently incomplete and experimental. In
     /// particular, they will lead to a panic when used in combination with
     /// multi-threaded rendering.
+    ///
+    /// # Panics
+    ///
+    /// Panics when this context uses multi-threaded rendering.
     pub fn push_filter_layer(&mut self, filter: Filter) {
         self.push_layer(None, None, None, None, Some(filter));
     }
@@ -567,7 +574,7 @@ impl RenderContext {
     /// Pop the last-pushed layer.
     pub fn pop_layer(&mut self) {
         self.dispatcher.pop_layer();
-        self.pop_root_transform();
+        self.root_transforms.pop_root();
     }
 
     /// Set the current stroke.
@@ -626,17 +633,17 @@ impl RenderContext {
     /// is drawn in, i.e., the paint transform is applied after the global transform. This allows
     /// transforming the paint independently from the drawn geometry.
     pub fn set_paint_transform(&mut self, paint_transform: Affine) {
-        self.state.paint_transform = paint_transform;
+        self.transforms_mut().set_paint_transform(paint_transform);
     }
 
     /// Get the current paint transform.
     pub fn paint_transform(&self) -> &Affine {
-        &self.state.paint_transform
+        self.transforms().paint_transform()
     }
 
     /// Reset the current paint transform.
     pub fn reset_paint_transform(&mut self) {
-        self.state.paint_transform = Affine::IDENTITY;
+        self.transforms_mut().reset_paint_transform();
     }
 
     /// Set the current fill rule.
@@ -666,23 +673,26 @@ impl RenderContext {
 
     /// Set the current transform.
     pub fn set_transform(&mut self, transform: Affine) {
-        self.state.transform = transform;
+        self.transforms_mut().set_transform(transform);
     }
 
     /// Get the current transform.
     pub fn transform(&self) -> &Affine {
-        &self.state.transform
+        self.transforms().transform()
     }
 
     /// Reset the current transform.
     pub fn reset_transform(&mut self) {
-        self.state.transform = Affine::IDENTITY;
+        self.transforms_mut().reset_transform();
     }
 
     /// Apply filter to the current paint (affects next drawn elements).
     ///
     /// This sets a filter that will be applied to the next drawn element.
     /// To apply a filter to multiple elements, use `push_filter_layer` instead.
+    /// # Panics
+    ///
+    /// When this context uses multi-threaded rendering.
     pub fn set_filter_effect(&mut self, filter: Filter) {
         self.filter = Some(filter);
     }
@@ -692,13 +702,20 @@ impl RenderContext {
         self.filter = None;
     }
 
+    /// Reset the render context and update the scene size.
+    pub fn reset_and_resize(&mut self, width: u16, height: u16) {
+        self.width = width;
+        self.height = height;
+
+        self.reset();
+    }
+
     /// Reset the render context.
     pub fn reset(&mut self) {
-        self.dispatcher.reset();
+        self.dispatcher.reset(self.width, self.height);
         self.encoded_paints.clear();
         self.mask = None;
-        self.root_transforms.clear();
-        self.root_transforms.push(Affine::IDENTITY);
+        self.root_transforms.reset();
         self.state.reset();
     }
 
@@ -707,7 +724,7 @@ impl RenderContext {
     /// See the explanation in the [clipping](https://github.com/linebender/vello/tree/main/sparse_strips/vello_cpu/examples)
     /// example for how this method differs from `push_clip_layer`.
     pub fn push_clip_path(&mut self, path: &BezPath) {
-        let transform = self.clip_path_transform();
+        let transform = self.transforms().clip_path_transform();
         self.dispatcher.push_clip_path(
             path,
             self.state.fill_rule,
@@ -954,7 +971,8 @@ mod tests {
     use vello_common::color::PremulRgba8;
     use vello_common::color::palette::css::{BLUE, RED};
     use vello_common::kurbo::{Rect, Shape};
-    use vello_common::pixmap::{Pixmap, PixmapMut};
+    use vello_common::peniko::ImageAlphaType;
+    use vello_common::pixmap::{PixelMetadata, Pixmap, PixmapMut};
     use vello_common::tile::Tile;
 
     const GRAY: PremulRgba8 = PremulRgba8 {
@@ -978,9 +996,10 @@ mod tests {
 
     fn solid_pixmap(width: u16, height: u16, color: PremulRgba8) -> Pixmap {
         Pixmap::from_parts(
-            vec![color; usize::from(width) * usize::from(height)],
+            bytemuck::cast_vec(vec![color; usize::from(width) * usize::from(height)]),
             width,
             height,
+            PixelMetadata::new(ImageAlphaType::AlphaPremultiplied, color.a != 255),
         )
     }
 
@@ -1076,6 +1095,28 @@ mod tests {
                     transparent_pixel()
                 };
                 assert_eq!(pixmap.sample(x, y), expected, "pixel at ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn reset_and_resize_updates_scene_size() {
+        let mut ctx = RenderContext::new(8, 4);
+        let mut resources = Resources::new();
+        let mut pixmap = Pixmap::new(4, 8);
+
+        ctx.reset_and_resize(4, 8);
+        assert_eq!(ctx.width(), 4);
+        assert_eq!(ctx.height(), 8);
+
+        ctx.set_paint(BLUE);
+        ctx.fill_rect(&Rect::new(0.0, 0.0, 4.0, 8.0));
+        ctx.flush();
+        ctx.render(&mut pixmap, &mut resources);
+
+        for y in 0..8 {
+            for x in 0..4 {
+                assert_eq!(pixmap.sample(x, y), blue_pixel(), "pixel at ({x}, {y})");
             }
         }
     }
@@ -1195,6 +1236,101 @@ mod tests {
         ctx.render_with(&mut pixmap, &mut resources, rasterizer_settings);
         ctx.flush();
         ctx.render_with(&mut pixmap, &mut resources, rasterizer_settings);
+    }
+
+    #[cfg(feature = "multithreading")]
+    #[test]
+    fn multithreaded_render_empty_frame_after_reset() {
+        use crate::RenderSettings;
+
+        let mut ctx = RenderContext::new_with(
+            100,
+            100,
+            RenderSettings {
+                num_threads: 4,
+                ..Default::default()
+            },
+        );
+        let mut resources = Resources::new();
+        let mut pixmap = Pixmap::new(100, 100);
+
+        ctx.fill_rect(&Rect::new(0.0, 0.0, 100.0, 100.0));
+        ctx.flush();
+        ctx.render(&mut pixmap, &mut resources);
+
+        ctx.reset();
+        ctx.flush();
+        ctx.render(&mut pixmap, &mut resources);
+    }
+
+    #[cfg(feature = "multithreading")]
+    #[test]
+    fn multithreaded_push_clip_path_before_draw() {
+        use crate::RenderSettings;
+
+        let mut ctx = RenderContext::new_with(
+            100,
+            100,
+            RenderSettings {
+                num_threads: 1,
+                ..Default::default()
+            },
+        );
+        let clip = Rect::new(0.0, 0.0, 50.0, 50.0).to_path(0.1);
+
+        // Just make sure we don't panic.
+        ctx.push_clip_path(&clip);
+        ctx.flush();
+        ctx.pop_clip_path();
+        ctx.flush();
+    }
+
+    #[cfg(feature = "multithreading")]
+    #[test]
+    fn multithreaded_reset_with_pending_tasks() {
+        use crate::RenderSettings;
+
+        let mut ctx = RenderContext::new_with(
+            100,
+            100,
+            RenderSettings {
+                num_threads: 4,
+                ..Default::default()
+            },
+        );
+
+        // Note: This test only works if we draw enough rectangles
+        // to trigger a batch send.
+        for _ in 0..300 {
+            ctx.fill_rect(&Rect::new(0.0, 0.0, 100., 100.0));
+        }
+
+        ctx.reset();
+    }
+
+    #[cfg(feature = "multithreading")]
+    #[test]
+    fn multithreaded_drop_with_pending_tasks() {
+        use crate::RenderSettings;
+
+        for _ in 0..10 {
+            let mut ctx = RenderContext::new_with(
+                100,
+                100,
+                RenderSettings {
+                    num_threads: 4,
+                    ..Default::default()
+                },
+            );
+
+            // Note: This test only works if we draw enough rectangles
+            // to trigger a batch send.
+            for _ in 0..300 {
+                ctx.fill_rect(&Rect::new(0.0, 0.0, 100., 100.0));
+            }
+
+            drop(ctx);
+        }
     }
 
     #[cfg(feature = "text")]

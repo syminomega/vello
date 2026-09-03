@@ -3,7 +3,9 @@
 
 //! Types for paints.
 
-use crate::pixmap::Pixmap;
+use crate::TextureId;
+use crate::geometry::RectU16;
+use crate::pixmap::{PixelMetadata, Pixmap};
 use alloc::sync::Arc;
 pub use peniko::Color;
 use peniko::{
@@ -30,11 +32,11 @@ impl IndexedPaint {
     }
 }
 
-/// A paint that is used internally by a rendering frontend to store how a wide tile command
-/// should be painted. There are only two types of paint:
+/// A paint used internally by a rendering frontend to store how a draw should be painted.
+/// There are only two types of paint:
 ///
 /// 1) Simple solid colors, which are stored in premultiplied representation so that
-///    each wide tile doesn't have to recompute it.
+///    the renderer doesn't have to recompute it.
 /// 2) Indexed paints, which can represent any arbitrary, more complex paint that is
 ///    determined by the frontend. The intended way of using this is to store a vector
 ///    of paints and store its index inside `IndexedPaint`.
@@ -74,11 +76,21 @@ impl ImageId {
 pub enum ImageSource {
     /// Pixmap pixels travel with the scene packet.
     Pixmap(Arc<Pixmap>),
+    // TODO: Explore whether we can merge opaque ID and external texture in some form?
     /// Pixmap pixels were registered earlier; this is just a handle.
     OpaqueId {
         /// The image handle.
         id: ImageId,
         /// Whether the image may contain non-opaque pixels.
+        may_have_transparency: bool,
+    },
+    /// An externally owned texture supplied to the renderer at render time.
+    ExternalTexture {
+        /// Opaque external texture handle.
+        id: TextureId,
+        /// Source region to sample from in texel coordinates.
+        source_region: RectU16,
+        /// Whether the source region may contain non-opaque pixels.
         may_have_transparency: bool,
     },
 }
@@ -104,11 +116,37 @@ impl ImageSource {
         }
     }
 
+    /// Create an image source backed by a texture supplied to the renderer at render time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `source_region` is empty.
+    pub fn external_texture(
+        texture_id: TextureId,
+        source_region: RectU16,
+        may_have_transparency: bool,
+    ) -> Self {
+        assert!(
+            !source_region.is_empty(),
+            "external texture source regions must not be empty"
+        );
+
+        Self::ExternalTexture {
+            id: texture_id,
+            source_region,
+            may_have_transparency,
+        }
+    }
+
     /// Returns whether this image source may contain non-opaque pixels.
     pub fn may_have_transparency(&self) -> bool {
         match self {
             Self::Pixmap(p) => p.may_have_transparency(),
             Self::OpaqueId {
+                may_have_transparency,
+                ..
+            }
+            | Self::ExternalTexture {
                 may_have_transparency,
                 ..
             } => *may_have_transparency,
@@ -126,8 +164,6 @@ impl ImageSource {
     pub fn from_peniko_image_data(image: &peniko::ImageData) -> Self {
         // TODO: how do we deal with `peniko::ImageFormat` growing? See also
         // <https://github.com/linebender/vello/pull/996#discussion_r2080510863>.
-        let do_alpha_multiply = image.alpha_type != peniko::ImageAlphaType::AlphaPremultiplied;
-
         assert!(
             image.width <= u16::MAX as u32 && image.height <= u16::MAX as u32,
             "The image is too big. Its width and height can be no larger than {} pixels.",
@@ -136,38 +172,27 @@ impl ImageSource {
         let width = image.width.try_into().unwrap();
         let height = image.height.try_into().unwrap();
 
-        // TODO: SIMD
-        #[expect(clippy::cast_possible_truncation, reason = "This cannot overflow.")]
-        let pixels = image
-            .data
-            .data()
-            .chunks_exact(4)
-            .map(|pixel| {
-                let rgba: [u8; 4] = match image.format {
-                    peniko::ImageFormat::Rgba8 => pixel.try_into().unwrap(),
-                    peniko::ImageFormat::Bgra8 => [pixel[2], pixel[1], pixel[0], pixel[3]],
-                    format => unimplemented!("Unsupported image format: {format:?}"),
-                };
-                let alpha = u16::from(rgba[3]);
-                let multiply = |component| ((alpha * u16::from(component)) / 255) as u8;
-                if do_alpha_multiply {
-                    PremulRgba8 {
-                        r: multiply(rgba[0]),
-                        g: multiply(rgba[1]),
-                        b: multiply(rgba[2]),
-                        a: rgba[3],
-                    }
-                } else {
-                    PremulRgba8 {
-                        r: rgba[0],
-                        g: rgba[1],
-                        b: rgba[2],
-                        a: rgba[3],
-                    }
+        // Unfortunately, we have to create a new allocation, because pixmap requires
+        // a real vector.
+        // TODO: Figure out a better story for this.
+        let mut rgba = image.data.data().to_vec();
+        match image.format {
+            peniko::ImageFormat::Rgba8 => {}
+            peniko::ImageFormat::Bgra8 => {
+                // TODO: SIMDify
+                for pixel in rgba.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
                 }
-            })
-            .collect();
-        let pixmap = Pixmap::from_parts(pixels, width, height);
+            }
+            format => unimplemented!("Unsupported image format: {format:?}"),
+        }
+
+        let pixmap = Pixmap::from_parts(
+            rgba,
+            width,
+            height,
+            PixelMetadata::new(image.alpha_type, true),
+        );
 
         Self::Pixmap(Arc::new(pixmap))
     }
@@ -274,3 +299,40 @@ pub struct Tint {
 
 /// A kind of paint that can be used for filling and stroking shapes.
 pub type PaintType = peniko::Brush<Image, Gradient>;
+
+#[cfg(test)]
+mod tests {
+    use super::ImageSource;
+    use alloc::sync::Arc;
+
+    fn image_data(pixels: &[u8], alpha_type: peniko::ImageAlphaType) -> peniko::ImageData {
+        peniko::ImageData {
+            data: peniko::Blob::new(Arc::new(pixels.to_vec())),
+            format: peniko::ImageFormat::Rgba8,
+            alpha_type,
+            width: (pixels.len() / 4) as u32,
+            height: 1,
+        }
+    }
+
+    #[test]
+    fn from_peniko_image_data_computes_transparency_hint() {
+        let opaque = image_data(
+            &[10, 20, 30, 255, 40, 50, 60, 255],
+            peniko::ImageAlphaType::Alpha,
+        );
+        assert!(!ImageSource::from_peniko_image_data(&opaque).may_have_transparency());
+
+        let translucent = image_data(
+            &[10, 20, 30, 255, 40, 50, 60, 128],
+            peniko::ImageAlphaType::Alpha,
+        );
+        assert!(ImageSource::from_peniko_image_data(&translucent).may_have_transparency());
+
+        let premultiplied = image_data(
+            &[10, 20, 30, 255, 40, 50, 60, 255],
+            peniko::ImageAlphaType::AlphaPremultiplied,
+        );
+        assert!(ImageSource::from_peniko_image_data(&premultiplied).may_have_transparency());
+    }
+}
